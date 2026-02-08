@@ -287,26 +287,36 @@ configure_deploy_key() {
     log_info "Configuring SSH deploy key for micro-data-center repo..."
     
     # Ensure SSH directory exists with correct permissions
-    mkdir -p "$SSH_DIR"
-    chmod 700 "$SSH_DIR"
-    
-    # Step 1 & 2: Check if key already exists
-    if [[ -f "$DEPLOY_KEY_PATH" && -f "$DEPLOY_KEY_PUB" ]]; then
-        log_info "Deploy key already exists: $DEPLOY_KEY_PATH"
+    if [[ ! -d "$SSH_DIR" ]]; then
+        log_info "Creating SSH directory: $SSH_DIR"
+        mkdir -p "$SSH_DIR"
+        chmod 700 "$SSH_DIR"
     else
-        # Step 3: Generate new Ed25519 key pair
+        log_info "SSH directory already exists: $SSH_DIR"
+    fi
+    
+    # Check if key already exists
+    local key_exists=false
+    if [[ -f "$DEPLOY_KEY_PATH" && -f "$DEPLOY_KEY_PUB" ]]; then
+        key_exists=true
+        log_info "Deploy key already exists: $DEPLOY_KEY_PATH (idempotent: skipping generation)"
+    else
+        # Generate new Ed25519 key pair
         log_info "Generating new Ed25519 SSH key pair..."
-        ssh-keygen -t ed25519 \
+        if ssh-keygen -t ed25519 \
             -f "$DEPLOY_KEY_PATH" \
             -N "" \
             -C "micro-data-center-deploy-key-$(hostname)-$(date +%Y%m%d)" \
-            -q
+            -q; then
+            chmod 600 "$DEPLOY_KEY_PATH"
+            chmod 644 "$DEPLOY_KEY_PUB"
+            log_info "SSH key pair generated successfully"
+        else
+            log_error "Failed to generate SSH key pair"
+            return 1
+        fi
         
-        chmod 600 "$DEPLOY_KEY_PATH"
-        chmod 644 "$DEPLOY_KEY_PUB"
-        log_info "SSH key pair generated successfully"
-        
-        # Step 5: Display public key for user to add to GitHub
+        # Display public key for user to add to GitHub
         echo ""
         log_warn "═══════════════════════════════════════════════════════════════"
         log_warn "ACTION REQUIRED: Add the following public key to GitHub"
@@ -318,15 +328,17 @@ configure_deploy_key() {
         log_warn "  1. Go to: https://github.com/helloskyy-io/micro-data-center/settings/keys"
         log_warn "  2. Click 'Add deploy key'"
         log_warn "  3. Paste the public key above"
-        log_warn "  4. Check 'Allow write access' (if needed)"
-        log_warn "  5. Click 'Add key'"
+        log_warn "  4. For production: Give the key READ access only"
+        log_warn "  5. For development: Check 'Allow write access'"
+        log_warn "  6. Click 'Add key'"
         echo ""
         log_warn "Press ENTER after you have added the key to GitHub..."
         read -r
     fi
     
-    # Step 4: Add key to SSH config if not already present
+    # Add key to SSH config if not already present (idempotent)
     if [[ ! -f "$SSH_CONFIG" ]]; then
+        log_info "Creating SSH config file: $SSH_CONFIG"
         touch "$SSH_CONFIG"
         chmod 600 "$SSH_CONFIG"
     fi
@@ -345,50 +357,82 @@ EOF
         chmod 600 "$SSH_CONFIG"
         log_info "SSH config updated"
     else
-        log_info "SSH config entry already exists for $SSH_HOST_ALIAS"
+        log_info "SSH config entry already exists for $SSH_HOST_ALIAS (idempotent: skipping)"
     fi
     
-    # Step 6: Test git access
+    # Always test git access (even if key existed - ensures it's properly configured)
     log_info "Testing SSH connection to GitHub..."
+    local access_verified=false
+    
+    # First try: SSH connection test
     if ssh -T -o StrictHostKeyChecking=no -o IdentitiesOnly=yes \
         -i "$DEPLOY_KEY_PATH" \
         git@github.com 2>&1 | grep -q "successfully authenticated"; then
         log_info "SSH connection test successful"
+        access_verified=true
     else
-        log_warn "SSH connection test inconclusive (this is normal for deploy keys)"
-        log_info "Attempting direct git test..."
+        log_info "SSH connection test inconclusive (this is normal for deploy keys)"
+        log_info "Attempting direct git repository access test..."
         
-        # Test by trying to fetch (this will work if key is properly configured)
+        # Second try: Direct git repository access test
         local test_dir="/tmp/mdc_key_test_$$"
-        mkdir -p "$test_dir"
-        cd "$test_dir"
+        mkdir -p "$test_dir" || {
+            log_error "Failed to create temporary test directory"
+            return 1
+        }
+        
+        cd "$test_dir" || {
+            log_error "Failed to change to test directory"
+            return 1
+        }
         
         # Use SSH config alias for testing
         local test_url="${GITHUB_REPO/git@github.com:/git@$SSH_HOST_ALIAS:}"
         if git ls-remote "$test_url" &> /dev/null; then
-            log_info "Git access test successful - key is properly configured"
-            cd /
-            rm -rf "$test_dir"
+            log_info "Git repository access test successful - key is properly configured"
+            access_verified=true
         else
-            log_error "Git access test failed"
-            log_error "Please verify:"
-            log_error "  1. The public key has been added to GitHub"
-            log_error "  2. The key has read (and write if needed) access"
-            log_error "  3. The repository exists and is accessible"
-            cd /
-            rm -rf "$test_dir"
+            log_error "Git repository access test failed"
+            log_error ""
+            log_error "Troubleshooting steps:"
+            log_error "  1. Verify the public key has been added to GitHub"
+            log_error "     Public key location: $DEPLOY_KEY_PUB"
+            log_error "     GitHub URL: https://github.com/helloskyy-io/micro-data-center/settings/keys"
+            log_error "  2. Verify the key has the correct permissions (read for prod, read/write for dev)"
+            log_error "  3. Verify the repository exists and is accessible"
+            log_error "  4. If the key was just added, wait a few seconds and try again"
+            log_error ""
             
-            if [[ "${SKIP_KEY_CHECK:-false}" != "true" ]]; then
-                log_error "Set SKIP_KEY_CHECK=true to continue anyway (not recommended)"
-                exit 1
+            if [[ "$key_exists" == "true" ]]; then
+                log_warn "Key exists but access test failed - key may not be added to GitHub"
+                log_warn "Displaying public key again for verification:"
+                echo ""
+                cat "$DEPLOY_KEY_PUB"
+                echo ""
             fi
         fi
+        
+        cd / || true
+        rm -rf "$test_dir" || true
+    fi
+    
+    # Final verification
+    if [[ "$access_verified" != "true" ]]; then
+        if [[ "${SKIP_KEY_CHECK:-false}" != "true" ]]; then
+            log_error "Git access verification failed - cannot proceed without repository access"
+            log_error "Set SKIP_KEY_CHECK=true to continue anyway (not recommended)"
+            return 1
+        else
+            log_warn "Skipping key check (SKIP_KEY_CHECK=true) - proceeding anyway"
+        fi
+    else
+        log_info "SSH key configuration verified successfully"
     fi
 }
 
 # Task 4: Clone MicroDatacenter repo
 clone_repo() {
-    log_info "Checking MicroDatacenter repo..."
+    log_info "Checking micro-data-center repository..."
     
     # Convert GitHub URL to use SSH config alias if deploy key is configured
     local repo_url="$GITHUB_REPO"
@@ -398,52 +442,117 @@ clone_repo() {
         # Keep the git@ prefix, only replace the hostname
         repo_url="${GITHUB_REPO/git@github.com:/git@$SSH_HOST_ALIAS:}"
         log_info "Using SSH config alias: git@$SSH_HOST_ALIAS"
+    else
+        log_warn "SSH config alias not found, using direct GitHub URL"
+        log_warn "This may fail if SSH keys are not properly configured"
     fi
     
-    # Check if repository already exists and is a valid git repository
+    # Check if repository already exists and is a valid git repository (idempotent)
     if [[ -d "$MDC_REPO_DIR" ]] && [[ -d "$MDC_REPO_DIR/.git" ]]; then
-        log_info "Repository already exists at $MDC_REPO_DIR"
+        log_info "Repository directory already exists at: $MDC_REPO_DIR (idempotent: checking validity)"
         
         # Verify it's a valid git repository
         if git -C "$MDC_REPO_DIR" rev-parse --git-dir > /dev/null 2>&1; then
             log_info "Valid git repository detected"
             
             # Update remote URL if it has changed (idempotent)
-            cd "$MDC_REPO_DIR"
+            cd "$MDC_REPO_DIR" || {
+                log_error "Failed to change to repository directory: $MDC_REPO_DIR"
+                return 1
+            }
+            
             local current_remote=$(git remote get-url origin 2>/dev/null || echo "")
             
             if [[ "$current_remote" != "$repo_url" ]]; then
-                log_info "Remote URL differs, updating from: $current_remote"
-                log_info "Updating to: $repo_url"
-                git remote set-url origin "$repo_url" || {
-                    log_warn "Failed to update remote URL, continuing anyway"
-                }
+                log_info "Remote URL differs, updating..."
+                log_info "  Current: $current_remote"
+                log_info "  New:     $repo_url"
+                if git remote set-url origin "$repo_url"; then
+                    log_info "Remote URL updated successfully"
+                else
+                    log_warn "Failed to update remote URL, continuing with existing remote"
+                fi
             else
-                log_info "Remote URL already correct: $repo_url"
+                log_info "Remote URL already correct: $repo_url (idempotent: skipping update)"
+            fi
+            
+            # Verify and fix ownership if needed (for IDE access)
+            local repo_owner=$(stat -c "%U:%G" "$MDC_REPO_DIR" 2>/dev/null)
+            if [[ "$repo_owner" != "root:$GROUP_NAME" ]]; then
+                log_info "Repository ownership needs update: current=$repo_owner, expected=root:$GROUP_NAME"
+                log_info "Fixing ownership to ensure IDE access works correctly..."
+                chown -R root:"$GROUP_NAME" "$MDC_REPO_DIR" || {
+                    log_warn "Failed to set ownership on existing repository (non-fatal, continuing)"
+                }
+                # Ensure directory permissions have setgid bit
+                find "$MDC_REPO_DIR" -type d -exec chmod 2775 {} \; || {
+                    log_warn "Failed to set directory permissions (non-fatal, continuing)"
+                }
+                log_info "Repository ownership and permissions updated"
+            else
+                log_info "Repository ownership already correct: root:$GROUP_NAME (idempotent: skipping)"
             fi
             
             # Bootstrap script only ensures repo exists - don't pull updates
             # (Updates should be handled by separate workflows/processes)
-            log_info "Repository is ready (skipping pull - bootstrap only ensures existence)"
+            log_info "Repository is ready (idempotent: skipping clone/pull)"
+            return 0
         else
-            log_error "Directory $MDC_REPO_DIR exists but is not a valid git repository"
-            log_error "Please remove it manually or choose a different location"
+            log_error "Directory exists but is not a valid git repository: $MDC_REPO_DIR"
+            log_error "This may indicate a corrupted or incomplete clone"
+            log_error "Please remove the directory manually and try again:"
+            log_error "  rm -rf $MDC_REPO_DIR"
             return 1
         fi
     elif [[ -e "$MDC_REPO_DIR" ]]; then
         # Path exists but is not a directory (could be a file)
-        log_error "Path $MDC_REPO_DIR exists but is not a directory"
-        log_error "Please remove it manually or choose a different location"
+        log_error "Path exists but is not a directory: $MDC_REPO_DIR"
+        log_error "Please remove it manually and try again:"
+        log_error "  rm -f $MDC_REPO_DIR"
         return 1
     else
         # Repository doesn't exist, clone it
-        log_info "Cloning MicroDatacenter repo to $MDC_REPO_DIR..."
-        mkdir -p "$(dirname "$MDC_REPO_DIR")"
+        log_info "Repository not found, cloning from: $repo_url"
+        log_info "Target directory: $MDC_REPO_DIR"
         
+        # Ensure parent directory exists
+        local parent_dir=$(dirname "$MDC_REPO_DIR")
+        if [[ ! -d "$parent_dir" ]]; then
+            log_info "Creating parent directory: $parent_dir"
+            mkdir -p "$parent_dir" || {
+                log_error "Failed to create parent directory: $parent_dir"
+                return 1
+            }
+        fi
+        
+        log_info "Cloning repository (this may take a moment)..."
         if git clone "$repo_url" "$MDC_REPO_DIR"; then
             log_info "Repository cloned successfully"
+            log_info "Location: $MDC_REPO_DIR"
+            
+            # Fix ownership of cloned files to ensure correct group (for IDE access)
+            log_info "Setting ownership of cloned repository to root:$GROUP_NAME..."
+            chown -R root:"$GROUP_NAME" "$MDC_REPO_DIR" || {
+                log_warn "Failed to set ownership on cloned repository (non-fatal, continuing)"
+            }
+            
+            # Ensure directory permissions have setgid bit (so new files inherit group)
+            log_info "Setting directory permissions with setgid bit..."
+            find "$MDC_REPO_DIR" -type d -exec chmod 2775 {} \; || {
+                log_warn "Failed to set directory permissions (non-fatal, continuing)"
+            }
+            
+            log_info "Repository ownership and permissions configured"
+            log_info "  Owner: root"
+            log_info "  Group: $GROUP_NAME"
+            log_info "  Directory permissions: 2775 (setgid - new files inherit group)"
         else
             log_error "Failed to clone repository"
+            log_error "Please verify:"
+            log_error "  1. SSH key has been added to GitHub"
+            log_error "  2. Repository URL is correct: $repo_url"
+            log_error "  3. Network connectivity is available"
+            log_error "  4. You have access to the repository"
             return 1
         fi
     fi
@@ -451,33 +560,74 @@ clone_repo() {
 
 # Task 5: Launch private bootstrap script
 launch_private_bootstrap() {
-    log_info "Launching private bootstrap script from micro-data-center..."
+    log_info "Preparing to launch private bootstrap script from micro-data-center..."
     
     local private_bootstrap="$MDC_REPO_DIR/components/temporal/scripts/bootstrap/bootstrap.sh"
     
-    if [[ ! -f "$private_bootstrap" ]]; then
-        log_error "Private bootstrap script not found at $private_bootstrap"
-        log_error "Please ensure the micro-data-center repository was cloned correctly"
+    # Verify repository was cloned successfully
+    if [[ ! -d "$MDC_REPO_DIR" ]]; then
+        log_error "Micro-data-center repository directory not found: $MDC_REPO_DIR"
+        log_error "Please ensure the repository was cloned successfully in the previous step"
         return 1
     fi
     
-    # Make sure the script is executable
-    chmod +x "$private_bootstrap"
+    # Verify private bootstrap script exists
+    if [[ ! -f "$private_bootstrap" ]]; then
+        log_error "Private bootstrap script not found at: $private_bootstrap"
+        log_error "Expected location: $MDC_REPO_DIR/components/temporal/scripts/bootstrap/bootstrap.sh"
+        log_error "Please verify:"
+        log_error "  1. The micro-data-center repository was cloned correctly"
+        log_error "  2. The repository contains the expected directory structure"
+        log_error "  3. You have access to the correct branch/version"
+        return 1
+    fi
     
-    log_info "Executing private bootstrap script..."
+    # Make sure the script is executable (idempotent)
+    if [[ ! -x "$private_bootstrap" ]]; then
+        log_info "Making private bootstrap script executable..."
+        chmod +x "$private_bootstrap" || {
+            log_error "Failed to make private bootstrap script executable"
+            return 1
+        }
+    else
+        log_info "Private bootstrap script is already executable (idempotent: skipping)"
+    fi
+    
+    log_info ""
     log_info "═══════════════════════════════════════════════════════════════"
-    log_info "Private Bootstrap Script Starting"
+    log_info "Launching Private Bootstrap Script"
     log_info "═══════════════════════════════════════════════════════════════"
+    log_info "Script location: $private_bootstrap"
+    log_info "All output from the private bootstrap will stream below..."
+    log_info "═══════════════════════════════════════════════════════════════"
+    log_info ""
     
     # Execute the private bootstrap script
-    bash "$private_bootstrap" || {
-        log_error "Private bootstrap script failed"
-        return 1
-    }
+    # Using bash with explicit unbuffered output to ensure log streaming
+    # The script's output will stream directly to stdout/stderr
+    bash "$private_bootstrap"
+    local exit_code=$?
     
-    log_info "═══════════════════════════════════════════════════════════════"
-    log_info "Private Bootstrap Script Completed"
-    log_info "═══════════════════════════════════════════════════════════════"
+    if [[ $exit_code -eq 0 ]]; then
+        log_info ""
+        log_info "═══════════════════════════════════════════════════════════════"
+        log_info "Private Bootstrap Script Completed Successfully"
+        log_info "═══════════════════════════════════════════════════════════════"
+        return 0
+    else
+        log_error ""
+        log_error "═══════════════════════════════════════════════════════════════"
+        log_error "Private Bootstrap Script Failed"
+        log_error "═══════════════════════════════════════════════════════════════"
+        log_error "Exit code: $exit_code"
+        log_error "Please review the output above for error details"
+        log_error "Common issues:"
+        log_error "  - Configuration file errors (check config.yaml and .env)"
+        log_error "  - Docker/container issues (check Docker is running)"
+        log_error "  - Network connectivity issues"
+        log_error "  - Insufficient permissions"
+        return 1
+    fi
 }
 
 # Main execution
@@ -485,45 +635,101 @@ main() {
     log_info "═══════════════════════════════════════════════════════════════"
     log_info "Micro Data Center Public Installer"
     log_info "═══════════════════════════════════════════════════════════════"
+    log_info "This script sets up the initial environment and launches the"
+    log_info "private bootstrap script to complete Temporal installation."
+    log_info "═══════════════════════════════════════════════════════════════"
     echo ""
     
     # Check if running as root
+    log_info "Verifying root access..."
     check_root
+    log_info "Root access verified"
+    echo ""
     
-    # Execute tasks in order
-    setup_folder_and_group || {
+    # Execute tasks in order with detailed error handling
+    log_info "Starting installation tasks..."
+    echo ""
+    
+    log_info "[Task 0/5] Setting up folder structure and user group..."
+    if setup_folder_and_group; then
+        log_info "[Task 0/5] ✓ Completed"
+    else
+        log_error "[Task 0/5] ✗ Failed"
         log_error "Failed to setup folder structure and group"
+        log_error "This is a critical error - cannot proceed without base directory"
         exit 1
-    }
+    fi
+    echo ""
     
-    install_docker || {
+    log_info "[Task 1/5] Installing Docker and Docker Compose..."
+    if install_docker; then
+        log_info "[Task 1/5] ✓ Completed"
+    else
+        log_error "[Task 1/5] ✗ Failed"
         log_error "Failed to install Docker"
+        log_error "Docker is required for Temporal infrastructure"
         exit 1
-    }
+    fi
+    echo ""
     
-    install_git || {
+    log_info "[Task 2/5] Installing Git and configuring identity..."
+    if install_git; then
+        log_info "[Task 2/5] ✓ Completed"
+    else
+        log_error "[Task 2/5] ✗ Failed"
         log_error "Failed to install Git"
+        log_error "Git is required to clone the micro-data-center repository"
         exit 1
-    }
+    fi
+    echo ""
     
-    configure_deploy_key || {
+    log_info "[Task 3/5] Configuring SSH deploy key for micro-data-center repository..."
+    if configure_deploy_key; then
+        log_info "[Task 3/5] ✓ Completed"
+    else
+        log_error "[Task 3/5] ✗ Failed"
         log_error "Failed to configure deploy key"
+        log_error "SSH key is required to access the private micro-data-center repository"
+        log_error "Please ensure the key was added to GitHub and try again"
         exit 1
-    }
+    fi
+    echo ""
     
-    clone_repo || {
+    log_info "[Task 4/5] Cloning micro-data-center repository..."
+    if clone_repo; then
+        log_info "[Task 4/5] ✓ Completed"
+    else
+        log_error "[Task 4/5] ✗ Failed"
         log_error "Failed to clone micro-data-center repository"
+        log_error "Please verify:"
+        log_error "  - SSH key has been added to GitHub"
+        log_error "  - Repository exists and is accessible"
+        log_error "  - Network connectivity is available"
         exit 1
-    }
+    fi
+    echo ""
     
-    launch_private_bootstrap || {
+    log_info "[Task 5/5] Launching private bootstrap script..."
+    if launch_private_bootstrap; then
+        log_info "[Task 5/5] ✓ Completed"
+    else
+        log_error "[Task 5/5] ✗ Failed"
         log_error "Failed to launch private bootstrap script"
+        log_error "Please review the private bootstrap output above for details"
         exit 1
-    }
+    fi
+    echo ""
     
     log_info ""
     log_info "═══════════════════════════════════════════════════════════════"
     log_info "Public Installer Completed Successfully"
+    log_info "═══════════════════════════════════════════════════════════════"
+    log_info "All installation tasks have been completed."
+    log_info "The Micro Data Center platform should now be operational."
+    log_info ""
+    log_info "Next steps:"
+    log_info "  - Review the Temporal UI at http://localhost:8080"
+    log_info "  - Start the Genesis workflow to complete initial setup"
     log_info "═══════════════════════════════════════════════════════════════"
 }
 
