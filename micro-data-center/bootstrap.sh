@@ -7,7 +7,7 @@
 # to the private bootstrap script in the micro-data-center repository.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/bootstrap.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/micro-data-center/bootstrap.sh | sudo bash
 #
 # Target state: "micro-data-center repo is cloned and private bootstrap script is ready to run"
 
