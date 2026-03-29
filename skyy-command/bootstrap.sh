@@ -1,15 +1,15 @@
 #!/bin/bash
 #
-# Micro Data Center Public Installer Script
-# 
-# This script is the public entry point for installing the Micro Data Center platform.
+# Skyy-Command Public Installer Script
+#
+# This script is the public entry point for installing the Skyy-Command platform.
 # It can be downloaded via curl and sets up the initial environment, then delegates
-# to the private bootstrap script in the micro-data-center repository.
+# to the private bootstrap script in the skyy-command repository.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/micro-data-center/bootstrap.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/skyy-command/bootstrap.sh | sudo bash
 #
-# Target state: "micro-data-center repo is cloned and private bootstrap script is ready to run"
+# Target state: "skyy-command repo is cloned and private bootstrap script is ready to run"
 
 set -euo pipefail
 
@@ -18,11 +18,11 @@ set -euo pipefail
 # Base directory for all Skyy-Net repositories
 BASE_DIR="${BASE_DIR:-/opt/skyy-net}"
 
-# MicroDatacenter repository directory - where the micro-data-center repo will be cloned
-MDC_REPO_DIR="${MDC_REPO_DIR:-$BASE_DIR/micro-data-center}"
+# Skyy-Command repository directory - where the skyy-command repo will be cloned
+MDC_REPO_DIR="${MDC_REPO_DIR:-$BASE_DIR/skyy-command}"
 
-# GitHub repository URL for MicroDatacenter repo
-GITHUB_REPO="${GITHUB_REPO:-git@github.com:helloskyy-io/micro-data-center.git}"
+# GitHub repository URL for Skyy-Command repo
+GITHUB_REPO="${GITHUB_REPO:-git@github.com:helloskyy-io/Skyy-Command.git}"
 
 # User group name for collaborative development access
 GROUP_NAME="${GROUP_NAME:-skyy-net}"
@@ -33,8 +33,8 @@ DEV_USER="${DEV_USER:-puma}"
 # SSH directory for deploy keys (root's .ssh directory)
 SSH_DIR="${SSH_DIR:-/root/.ssh}"
 
-# SSH deploy key name for MicroDatacenter repo
-KEY_NAME="micro-data-center-deploy"
+# SSH deploy key name for Skyy-Command repo
+KEY_NAME="skyy-command-deploy"
 
 # SSH deploy key paths (private and public)
 DEPLOY_KEY_PATH="${DEPLOY_KEY_PATH:-$SSH_DIR/$KEY_NAME}"
@@ -44,7 +44,7 @@ DEPLOY_KEY_PUB="${DEPLOY_KEY_PUB:-$SSH_DIR/$KEY_NAME.pub}"
 SSH_CONFIG="${SSH_CONFIG:-$SSH_DIR/config}"
 
 # SSH host alias for GitHub access via deploy key
-SSH_HOST_ALIAS="micro-data-center-github"
+SSH_HOST_ALIAS="skyy-command-github"
 
 # Git identity configuration (for root user)
 GIT_USER_NAME="${GIT_USER_NAME:-SkyyCommand Platform}"
@@ -284,7 +284,7 @@ install_git() {
 
 # Task 3: Configure SSH / deploy key for private GitHub repo
 configure_deploy_key() {
-    log_info "Configuring SSH deploy key for micro-data-center repo..."
+    log_info "Configuring SSH deploy key for skyy-command repo..."
     
     # Ensure SSH directory exists with correct permissions
     if [[ ! -d "$SSH_DIR" ]]; then
@@ -306,7 +306,7 @@ configure_deploy_key() {
         if ssh-keygen -t ed25519 \
             -f "$DEPLOY_KEY_PATH" \
             -N "" \
-            -C "micro-data-center-deploy-key-$(hostname)-$(date +%Y%m%d)" \
+            -C "skyy-command-deploy-key-$(hostname)-$(date +%Y%m%d)" \
             -q; then
             chmod 600 "$DEPLOY_KEY_PATH"
             chmod 644 "$DEPLOY_KEY_PUB"
@@ -325,7 +325,7 @@ configure_deploy_key() {
         cat "$DEPLOY_KEY_PUB"
         echo ""
         log_warn "Steps to add key to GitHub:"
-        log_warn "  1. Go to: https://github.com/helloskyy-io/micro-data-center/settings/keys"
+        log_warn "  1. Go to: https://github.com/helloskyy-io/Skyy-Command/settings/keys"
         log_warn "  2. Click 'Add deploy key'"
         log_warn "  3. Paste the public key above"
         log_warn "  4. For production: Give the key READ access only"
@@ -344,10 +344,10 @@ configure_deploy_key() {
     fi
     
     if ! grep -q "Host $SSH_HOST_ALIAS" "$SSH_CONFIG" 2>/dev/null; then
-        log_info "Adding SSH config entry for micro-data-center repo..."
+        log_info "Adding SSH config entry for skyy-command repo..."
         cat >> "$SSH_CONFIG" <<EOF
 
-# Micro-data-center repo deploy key
+# Skyy-Command repo deploy key
 Host $SSH_HOST_ALIAS
     HostName github.com
     User git
@@ -397,7 +397,7 @@ EOF
             log_error "Troubleshooting steps:"
             log_error "  1. Verify the public key has been added to GitHub"
             log_error "     Public key location: $DEPLOY_KEY_PUB"
-            log_error "     GitHub URL: https://github.com/helloskyy-io/micro-data-center/settings/keys"
+            log_error "     GitHub URL: https://github.com/helloskyy-io/Skyy-Command/settings/keys"
             log_error "  2. Verify the key has the correct permissions (read for prod, read/write for dev)"
             log_error "  3. Verify the repository exists and is accessible"
             log_error "  4. If the key was just added, wait a few seconds and try again"
@@ -432,13 +432,13 @@ EOF
 
 # Task 4: Clone MicroDatacenter repo
 clone_repo() {
-    log_info "Checking micro-data-center repository..."
+    log_info "Checking skyy-command repository..."
     
     # Convert GitHub URL to use SSH config alias if deploy key is configured
     local repo_url="$GITHUB_REPO"
     if [[ -f "$DEPLOY_KEY_PATH" && -f "$SSH_CONFIG" ]] && \
        grep -q "Host $SSH_HOST_ALIAS" "$SSH_CONFIG" 2>/dev/null; then
-        # Use SSH config alias: git@github.com -> git@micro-data-center-github
+        # Use SSH config alias: git@github.com -> git@skyy-command-github
         # Keep the git@ prefix, only replace the hostname
         repo_url="${GITHUB_REPO/git@github.com:/git@$SSH_HOST_ALIAS:}"
         log_info "Using SSH config alias: git@$SSH_HOST_ALIAS"
@@ -560,13 +560,13 @@ clone_repo() {
 
 # Task 5: Launch private bootstrap script
 launch_private_bootstrap() {
-    log_info "Preparing to launch private bootstrap script from micro-data-center..."
+    log_info "Preparing to launch private bootstrap script from skyy-command..."
     
     local private_bootstrap="$MDC_REPO_DIR/components/temporal/scripts/bootstrap/bootstrap.sh"
     
     # Verify repository was cloned successfully
     if [[ ! -d "$MDC_REPO_DIR" ]]; then
-        log_error "Micro-data-center repository directory not found: $MDC_REPO_DIR"
+        log_error "Skyy-Command repository directory not found: $MDC_REPO_DIR"
         log_error "Please ensure the repository was cloned successfully in the previous step"
         return 1
     fi
@@ -576,7 +576,7 @@ launch_private_bootstrap() {
         log_error "Private bootstrap script not found at: $private_bootstrap"
         log_error "Expected location: $MDC_REPO_DIR/components/temporal/scripts/bootstrap/bootstrap.sh"
         log_error "Please verify:"
-        log_error "  1. The micro-data-center repository was cloned correctly"
+        log_error "  1. The skyy-command repository was cloned correctly"
         log_error "  2. The repository contains the expected directory structure"
         log_error "  3. You have access to the correct branch/version"
         return 1
@@ -633,7 +633,7 @@ launch_private_bootstrap() {
 # Main execution
 main() {
     log_info "═══════════════════════════════════════════════════════════════"
-    log_info "Micro Data Center Public Installer"
+    log_info "Skyy-Command Public Installer"
     log_info "═══════════════════════════════════════════════════════════════"
     log_info "This script sets up the initial environment and launches the"
     log_info "private bootstrap script to complete Temporal installation."
@@ -678,29 +678,29 @@ main() {
     else
         log_error "[Task 2/5] ✗ Failed"
         log_error "Failed to install Git"
-        log_error "Git is required to clone the micro-data-center repository"
+        log_error "Git is required to clone the skyy-command repository"
         exit 1
     fi
     echo ""
     
-    log_info "[Task 3/5] Configuring SSH deploy key for micro-data-center repository..."
+    log_info "[Task 3/5] Configuring SSH deploy key for skyy-command repository..."
     if configure_deploy_key; then
         log_info "[Task 3/5] ✓ Completed"
     else
         log_error "[Task 3/5] ✗ Failed"
         log_error "Failed to configure deploy key"
-        log_error "SSH key is required to access the private micro-data-center repository"
+        log_error "SSH key is required to access the private skyy-command repository"
         log_error "Please ensure the key was added to GitHub and try again"
         exit 1
     fi
     echo ""
     
-    log_info "[Task 4/5] Cloning micro-data-center repository..."
+    log_info "[Task 4/5] Cloning skyy-command repository..."
     if clone_repo; then
         log_info "[Task 4/5] ✓ Completed"
     else
         log_error "[Task 4/5] ✗ Failed"
-        log_error "Failed to clone micro-data-center repository"
+        log_error "Failed to clone skyy-command repository"
         log_error "Please verify:"
         log_error "  - SSH key has been added to GitHub"
         log_error "  - Repository exists and is accessible"
