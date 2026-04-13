@@ -725,7 +725,7 @@ main() {
     log_info "Public Installer Completed Successfully"
     log_info "═══════════════════════════════════════════════════════════════"
     log_info "All installation tasks have been completed."
-    log_info "The Micro Data Center platform should now be operational."
+    log_info "The Skyy-Command control plane should now be operational."
     log_info ""
     log_info "Next steps:"
     log_info "  - Review the Temporal UI at http://localhost:8080"
