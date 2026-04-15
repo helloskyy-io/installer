@@ -78,7 +78,22 @@ check_root() {
 # Task 0: Create folder structure and user group
 setup_folder_and_group() {
     log_info "Setting up folder structure and user group..."
-    
+
+    # Ensure the `acl` package is installed — setfacl is required below for
+    # default POSIX ACLs on $BASE_DIR. `setfacl` is NOT installed on a fresh
+    # Ubuntu Server by default despite being a POSIX-standard tool.
+    if ! command -v setfacl >/dev/null 2>&1; then
+        log_info "Installing 'acl' package (provides setfacl for POSIX ACLs)..."
+        apt-get update -qq
+        apt-get install -y acl || {
+            log_error "Failed to install 'acl' package"
+            return 1
+        }
+        log_info "'acl' package installed successfully"
+    else
+        log_info "'acl' package already installed (setfacl found): $(command -v setfacl)"
+    fi
+
     # Create base directory if it doesn't exist
     if [[ ! -d "$BASE_DIR" ]]; then
         log_info "Creating base directory: $BASE_DIR"
@@ -155,16 +170,66 @@ setup_folder_and_group() {
     else
         log_info "Directory permissions already correct (2775), skipping"
     fi
-    
-    # Note: We do NOT change file permissions - Git preserves them correctly
-    # The setgid bit (2775) on directories ensures new files get the correct group automatically
-    
+
+    # POSIX default ACLs — apply group write regardless of root's umask.
+    #
+    # Why: setgid on directories (2775 above) only controls group OWNERSHIP
+    # inheritance for new files. It does NOT control permission BITS. Root
+    # processes (migration scripts, Ansible, Genesis activities) create files
+    # with umask 022, which means new files land with mode 644 — owner rw,
+    # group READ ONLY. The setgid bit gives those files the right group
+    # (skyy-net), but members of the group still can't write them, because
+    # the group-write bit was never set.
+    #
+    # This bit us on 2026-04-12 during the Phase 1a migration: Ansible-created
+    # files inherited group=skyy-net but mode=644, and puma (in the skyy-net
+    # group) couldn't edit them via the IDE. The fix is POSIX default ACLs,
+    # which override the umask for the specified group.
+    #
+    # Two setfacl calls:
+    #   -m  (modify)   — applies the ACL to files that exist RIGHT NOW
+    #   -d -m (default) — sets a default ACL on directories so that any file
+    #                     created under them in the future inherits the ACL
+    #                     automatically, regardless of what umask the creating
+    #                     process uses
+    #
+    # The default ACL also automatically extends to any new subtree cloned
+    # under $BASE_DIR later (e.g. `git clone` of a new repo), so this is a
+    # one-time setup that never needs re-application.
+    #
+    # Idempotency: setfacl is inherently idempotent — running it a second
+    # time with the same rule is a no-op. We check for the marker in
+    # `getfacl` output to skip noisy logs on re-runs.
+    local needs_acls=true
+    if getfacl -p "$BASE_DIR" 2>/dev/null | grep -q "^default:group:$GROUP_NAME:rwx"; then
+        needs_acls=false
+        log_info "POSIX default ACL already set on $BASE_DIR for group '$GROUP_NAME', skipping"
+    fi
+
+    if [[ "$needs_acls" == "true" ]]; then
+        log_info "Applying POSIX ACLs to $BASE_DIR for group '$GROUP_NAME'..."
+
+        # Apply to existing files and directories
+        setfacl -R -m "g:$GROUP_NAME:rwx" "$BASE_DIR" || {
+            log_error "Failed to apply existing-file ACL to $BASE_DIR"
+            return 1
+        }
+        log_info "  Applied existing-file ACL: g:$GROUP_NAME:rwx"
+
+        # Set default ACL so future files inherit group write regardless of umask
+        setfacl -R -d -m "g:$GROUP_NAME:rwx" "$BASE_DIR" || {
+            log_error "Failed to apply default ACL to $BASE_DIR"
+            return 1
+        }
+        log_info "  Applied default ACL:       g:$GROUP_NAME:rwx (new files inherit this)"
+    fi
+
     log_info "Folder structure and group setup completed successfully"
     log_info "  Directory: $BASE_DIR"
     log_info "  Owner: root"
     log_info "  Group: $GROUP_NAME"
     log_info "  Directory permissions: 2775 (setgid enabled - new files inherit group)"
-    log_info "  Note: File permissions are preserved from Git (not modified)"
+    log_info "  POSIX default ACL: g:$GROUP_NAME:rwx (new files are group-writable)"
 }
 
 # Task 1: Install Docker + Compose
