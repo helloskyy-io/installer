@@ -28,7 +28,16 @@ GITHUB_REPO="${GITHUB_REPO:-git@github.com:helloskyy-io/Skyy-Command.git}"
 GROUP_NAME="${GROUP_NAME:-skyy-net}"
 
 # Development user to add to the group (for SSH access via IDE)
-DEV_USER="${DEV_USER:-puma}"
+#
+# Priority: explicit $DEV_USER override → $SUDO_USER (the operator who ran
+# `sudo bash`) → fallback "puma" (preserves historical behavior for
+# direct-as-root invocations where $SUDO_USER is unset).
+#
+# Why auto-detect: every fresh-MDC stand-up needs the operator wired into
+# the skyy-net group and POSIX ACLs. Hardcoding "puma" made that step fail
+# for anyone else, and manually exporting DEV_USER is a friction point we
+# kept forgetting.
+DEV_USER="${DEV_USER:-${SUDO_USER:-puma}}"
 
 # SSH directory for deploy keys (root's .ssh directory)
 SSH_DIR="${SSH_DIR:-/root/.ssh}"
@@ -232,7 +241,163 @@ setup_folder_and_group() {
     log_info "  POSIX default ACL: g:$GROUP_NAME:rwx (new files are group-writable)"
 }
 
-# Task 1: Install Docker + Compose
+# Task 1: Bootstrap operator's ~/.ssh/config with wildcard *-github alias block
+#
+# Why this task exists:
+#   After Genesis runs, it writes a per-MDC SSH alias (e.g.
+#   `desired-state-<mdc-id>-github`) into /root/.ssh/config so root can push
+#   to the desired-state repo. But the operator who actually uses the IDE
+#   and runs git commands from their own shell has a separate
+#   ~/.ssh/config — and it never gets the alias. Result: operator can't
+#   push to desired-state from their user account, and every new MDC
+#   stand-up we end up manually copying the block from /root/.ssh/config.
+#
+# Why a wildcard pattern instead of per-MDC entries:
+#   The installer runs BEFORE Genesis generates the mdc_id, so we literally
+#   cannot write the per-MDC alias at this point — the mdc_id doesn't
+#   exist yet. Instead we drop a single `Host *-github` block that matches
+#   any future alias ending in `-github` (skyy-command-github,
+#   skyy-gate-github, desired-state-<mdc-id>-github, …). This is a
+#   one-time setup per operator — every alias Genesis or future tooling
+#   creates automatically inherits the right HostName/User/IdentityFile.
+#
+# Identity file: we point at ~/.ssh/id_ed25519 (the conventional default
+# operator master key). If the operator doesn't have that file we still
+# write the block and warn — they can either generate the key or edit the
+# block to point at whatever key they use.
+#
+# Scope: single-operator MDCs only. Second operators sharing the same MDC
+# copy the block manually (rare enough to not warrant installer logic).
+setup_operator_ssh_config() {
+    log_info "Configuring operator SSH config for '$DEV_USER'..."
+
+    # ---------------------------------------------------------------------
+    # Preflight: can we even proceed?
+    # ---------------------------------------------------------------------
+    # Gracefully skip if the operator user doesn't exist yet — we don't
+    # want the whole installer to abort over a missing dev account.
+    if ! id "$DEV_USER" &>/dev/null; then
+        log_warn "User '$DEV_USER' does not exist, skipping operator SSH config setup"
+        log_warn "To configure SSH for a different operator, re-run with DEV_USER=<name> or ensure \$SUDO_USER is set"
+        return 0
+    fi
+
+    local operator_home operator_group
+    operator_home=$(getent passwd "$DEV_USER" | cut -d: -f6)
+    if [[ -z "$operator_home" || ! -d "$operator_home" ]]; then
+        log_warn "Could not resolve home directory for '$DEV_USER', skipping operator SSH config setup"
+        return 0
+    fi
+
+    # Resolve the operator's actual primary group — don't assume it matches
+    # $DEV_USER. Most distros use user-private-groups (e.g. puma:puma), but
+    # systems provisioned with a shared primary group (e.g. puma:users)
+    # would break a hardcoded "$DEV_USER:$DEV_USER" chown, and SSH rejects
+    # config/dir ownership mismatches.
+    operator_group=$(id -gn "$DEV_USER" 2>/dev/null)
+    if [[ -z "$operator_group" ]]; then
+        log_warn "Could not resolve primary group for '$DEV_USER', skipping operator SSH config setup"
+        return 0
+    fi
+
+    local operator_ssh_dir="$operator_home/.ssh"
+    local operator_ssh_config="$operator_ssh_dir/config"
+    local operator_master_key="$operator_ssh_dir/id_ed25519"
+    local marker_begin="# BEGIN skyy-net installer managed block"
+    local marker_end="# END skyy-net installer managed block"
+
+    # Reject pre-existing symlinks at our write targets — this script runs
+    # as root, so following a symlink planted under $operator_home could
+    # redirect writes to an arbitrary path (e.g. /root/.ssh/config). On a
+    # fresh-VM bootstrap this is unlikely, but the check is cheap and
+    # prevents the foot-gun outright.
+    if [[ -L "$operator_ssh_dir" ]]; then
+        log_warn "$operator_ssh_dir is a symlink — refusing to write to it, skipping operator SSH config setup"
+        return 0
+    fi
+    if [[ -L "$operator_ssh_config" ]]; then
+        log_warn "$operator_ssh_config is a symlink — refusing to write to it, skipping operator SSH config setup"
+        return 0
+    fi
+
+    # ---------------------------------------------------------------------
+    # Write phase: create dir/file and append the managed block
+    # ---------------------------------------------------------------------
+    # Ensure ~/.ssh/ exists with mode 0700 and correct ownership
+    if [[ ! -d "$operator_ssh_dir" ]]; then
+        log_info "Creating $operator_ssh_dir (mode 0700)"
+        mkdir -p "$operator_ssh_dir"
+        chmod 0700 "$operator_ssh_dir"
+        chown "$DEV_USER:$operator_group" "$operator_ssh_dir"
+    else
+        log_info "$operator_ssh_dir already exists"
+    fi
+
+    # Ensure config file exists with mode 0600 and correct ownership
+    if [[ ! -f "$operator_ssh_config" ]]; then
+        log_info "Creating $operator_ssh_config (mode 0600)"
+        touch "$operator_ssh_config"
+        chmod 0600 "$operator_ssh_config"
+        chown "$DEV_USER:$operator_group" "$operator_ssh_config"
+    fi
+
+    # Idempotency: if our marker block is already present, skip. If the
+    # begin marker is present but the end marker is missing, the operator
+    # (or a previous failed run) left the block half-removed — warn rather
+    # than silently duplicate or silently skip.
+    local has_begin has_end
+    grep -qF "$marker_begin" "$operator_ssh_config" && has_begin=1 || has_begin=0
+    grep -qF "$marker_end" "$operator_ssh_config" && has_end=1 || has_end=0
+
+    if [[ $has_begin -eq 1 && $has_end -eq 1 ]]; then
+        log_info "Wildcard *-github alias block already present in $operator_ssh_config (idempotent: skipping)"
+    elif [[ $has_begin -eq 1 && $has_end -eq 0 ]]; then
+        log_warn "Found BEGIN marker but no END marker in $operator_ssh_config"
+        log_warn "  The managed block appears to have been partially deleted."
+        log_warn "  Please remove everything from the BEGIN marker onward and re-run the installer."
+        log_warn "  Skipping to avoid duplicating or corrupting the block."
+    else
+        log_info "Appending wildcard *-github alias block to $operator_ssh_config"
+        # Leading blank line keeps our block visually separated from any
+        # prior content the operator may already have in config.
+        cat >> "$operator_ssh_config" <<EOF
+
+$marker_begin
+# Wildcard alias for any GitHub deploy-key host (skyy-command-github,
+# skyy-gate-github, desired-state-<mdc-id>-github, etc.).
+# Managed by installer/skyy-command/bootstrap.sh — safe to edit, but keep
+# the BEGIN/END markers so re-running the installer is a no-op.
+Host *-github
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+$marker_end
+EOF
+        # Re-assert perms/ownership after write (appending can leave
+        # intermediate state if the operator's umask is unusual).
+        chmod 0600 "$operator_ssh_config"
+        chown "$DEV_USER:$operator_group" "$operator_ssh_config"
+        log_info "Wildcard *-github alias block appended"
+    fi
+
+    # Master key sanity check — warn, don't fail. Operators who use a
+    # non-default key name need to edit the IdentityFile line themselves.
+    if [[ ! -f "$operator_master_key" ]]; then
+        log_warn "Operator master key not found at $operator_master_key"
+        log_warn "  The *-github alias block points at ~/.ssh/id_ed25519 by default."
+        log_warn "  You have two options:"
+        log_warn "    1. Generate one: sudo -u $DEV_USER ssh-keygen -t ed25519 -f $operator_master_key -N ''"
+        log_warn "    2. Edit $operator_ssh_config and change 'IdentityFile ~/.ssh/id_ed25519'"
+        log_warn "       to point at whatever key '$DEV_USER' actually uses."
+    else
+        log_info "Operator master key present: $operator_master_key"
+    fi
+
+    log_info "Operator SSH config setup completed"
+}
+
+# Task 2: Install Docker + Compose
 install_docker() {
     log_info "Checking Docker installation..."
     
@@ -304,7 +469,67 @@ install_docker() {
     fi
 }
 
-# Task 2: Install git and configure identity
+# Task 3: Install Helm
+#
+# Why this is here:
+#   The private bootstrap script
+#   (skyy-command/components/temporal/scripts/bootstrap/bootstrap.sh)
+#   requires `helm` on PATH for the chart-rendering pipeline after the
+#   Phase 1c A4 refactor (skyy-command PR #29). A fresh VM without helm
+#   hits a clear error downstream, but provisioning helm proactively is
+#   a cleaner onboarding experience.
+#
+# Install method: the official get-helm-3 script, downloaded to a
+# tempfile first (never piped straight into bash). Matches the security
+# posture of the Docker install above — the downloaded script is
+# on-disk and auditable if the install fails.
+install_helm() {
+    log_info "Checking helm installation..."
+
+    if command -v helm &> /dev/null; then
+        log_info "helm already installed: $(helm version --short)"
+        return 0
+    fi
+
+    log_info "Installing helm via official get-helm-3 script..."
+
+    # Use mktemp to avoid a predictable-path race on /tmp — another
+    # process could race to replace a fixed-path tempfile between the
+    # curl write and the execute, and since we run as root, that's a
+    # privilege-escalation vector. mktemp gives us a unique, unpredictable
+    # path with 0600 perms out of the box.
+    local installer_script
+    installer_script=$(mktemp /tmp/get-helm-3-XXXXXX.sh) || {
+        log_error "Failed to create tempfile for helm installer"
+        return 1
+    }
+    if ! curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
+            -o "$installer_script"; then
+        log_error "Failed to download helm install script"
+        rm -f "$installer_script"
+        return 1
+    fi
+    chmod 700 "$installer_script"
+
+    if ! "$installer_script"; then
+        log_error "helm install script failed"
+        rm -f "$installer_script"
+        return 1
+    fi
+    rm -f "$installer_script"
+
+    # Verify helm actually ended up on PATH — if the install script
+    # "succeeded" but helm isn't callable, downstream Phase 2 bootstrap
+    # will fail. Fail loudly here instead.
+    if ! command -v helm &> /dev/null; then
+        log_error "helm install script completed but 'helm' is not on PATH"
+        return 1
+    fi
+
+    log_info "helm installed: $(helm version --short)"
+}
+
+# Task 4: Install git and configure identity
 install_git() {
     log_info "Checking git installation..."
     
@@ -347,7 +572,7 @@ install_git() {
     log_info "Git identity configuration completed"
 }
 
-# Task 3: Configure SSH / deploy key for private GitHub repo
+# Task 5: Configure SSH / deploy key for private GitHub repo
 configure_deploy_key() {
     log_info "Configuring SSH deploy key for skyy-command repo..."
     
@@ -495,7 +720,7 @@ EOF
     fi
 }
 
-# Task 4: Clone MicroDatacenter repo
+# Task 6: Clone MicroDatacenter repo
 clone_repo() {
     log_info "Checking skyy-command repository..."
     
@@ -623,7 +848,7 @@ clone_repo() {
     fi
 }
 
-# Task 5: Launch private bootstrap script
+# Task 7: Launch private bootstrap script
 launch_private_bootstrap() {
     log_info "Preparing to launch private bootstrap script from skyy-command..."
     
@@ -715,56 +940,77 @@ main() {
     log_info "Starting installation tasks..."
     echo ""
     
-    log_info "[Task 0/5] Setting up folder structure and user group..."
+    log_info "[Task 0/7] Setting up folder structure and user group..."
     if setup_folder_and_group; then
-        log_info "[Task 0/5] ✓ Completed"
+        log_info "[Task 0/7] ✓ Completed"
     else
-        log_error "[Task 0/5] ✗ Failed"
+        log_error "[Task 0/7] ✗ Failed"
         log_error "Failed to setup folder structure and group"
         log_error "This is a critical error - cannot proceed without base directory"
         exit 1
     fi
     echo ""
-    
-    log_info "[Task 1/5] Installing Docker and Docker Compose..."
-    if install_docker; then
-        log_info "[Task 1/5] ✓ Completed"
+
+    log_info "[Task 1/7] Configuring operator SSH config (wildcard *-github alias)..."
+    if setup_operator_ssh_config; then
+        log_info "[Task 1/7] ✓ Completed"
     else
-        log_error "[Task 1/5] ✗ Failed"
+        log_error "[Task 1/7] ✗ Failed"
+        log_error "Failed to configure operator SSH config"
+        exit 1
+    fi
+    echo ""
+
+    log_info "[Task 2/7] Installing Docker and Docker Compose..."
+    if install_docker; then
+        log_info "[Task 2/7] ✓ Completed"
+    else
+        log_error "[Task 2/7] ✗ Failed"
         log_error "Failed to install Docker"
         log_error "Docker is required for Temporal infrastructure"
         exit 1
     fi
     echo ""
-    
-    log_info "[Task 2/5] Installing Git and configuring identity..."
-    if install_git; then
-        log_info "[Task 2/5] ✓ Completed"
+
+    log_info "[Task 3/7] Installing Helm..."
+    if install_helm; then
+        log_info "[Task 3/7] ✓ Completed"
     else
-        log_error "[Task 2/5] ✗ Failed"
+        log_error "[Task 3/7] ✗ Failed"
+        log_error "Failed to install helm"
+        log_error "helm is required by the private bootstrap's chart-rendering pipeline"
+        exit 1
+    fi
+    echo ""
+
+    log_info "[Task 4/7] Installing Git and configuring identity..."
+    if install_git; then
+        log_info "[Task 4/7] ✓ Completed"
+    else
+        log_error "[Task 4/7] ✗ Failed"
         log_error "Failed to install Git"
         log_error "Git is required to clone the skyy-command repository"
         exit 1
     fi
     echo ""
-    
-    log_info "[Task 3/5] Configuring SSH deploy key for skyy-command repository..."
+
+    log_info "[Task 5/7] Configuring SSH deploy key for skyy-command repository..."
     if configure_deploy_key; then
-        log_info "[Task 3/5] ✓ Completed"
+        log_info "[Task 5/7] ✓ Completed"
     else
-        log_error "[Task 3/5] ✗ Failed"
+        log_error "[Task 5/7] ✗ Failed"
         log_error "Failed to configure deploy key"
         log_error "SSH key is required to access the private skyy-command repository"
         log_error "Please ensure the key was added to GitHub and try again"
         exit 1
     fi
     echo ""
-    
-    log_info "[Task 4/5] Cloning skyy-command repository..."
+
+    log_info "[Task 6/7] Cloning skyy-command repository..."
     if clone_repo; then
-        log_info "[Task 4/5] ✓ Completed"
+        log_info "[Task 6/7] ✓ Completed"
     else
-        log_error "[Task 4/5] ✗ Failed"
+        log_error "[Task 6/7] ✗ Failed"
         log_error "Failed to clone skyy-command repository"
         log_error "Please verify:"
         log_error "  - SSH key has been added to GitHub"
@@ -773,12 +1019,12 @@ main() {
         exit 1
     fi
     echo ""
-    
-    log_info "[Task 5/5] Launching private bootstrap script..."
+
+    log_info "[Task 7/7] Launching private bootstrap script..."
     if launch_private_bootstrap; then
-        log_info "[Task 5/5] ✓ Completed"
+        log_info "[Task 7/7] ✓ Completed"
     else
-        log_error "[Task 5/5] ✗ Failed"
+        log_error "[Task 7/7] ✗ Failed"
         log_error "Failed to launch private bootstrap script"
         log_error "Please review the private bootstrap output above for details"
         exit 1
