@@ -271,6 +271,9 @@ setup_folder_and_group() {
 setup_operator_ssh_config() {
     log_info "Configuring operator SSH config for '$DEV_USER'..."
 
+    # ---------------------------------------------------------------------
+    # Preflight: can we even proceed?
+    # ---------------------------------------------------------------------
     # Gracefully skip if the operator user doesn't exist yet — we don't
     # want the whole installer to abort over a missing dev account.
     if ! id "$DEV_USER" &>/dev/null; then
@@ -279,10 +282,21 @@ setup_operator_ssh_config() {
         return 0
     fi
 
-    local operator_home
+    local operator_home operator_group
     operator_home=$(getent passwd "$DEV_USER" | cut -d: -f6)
     if [[ -z "$operator_home" || ! -d "$operator_home" ]]; then
         log_warn "Could not resolve home directory for '$DEV_USER', skipping operator SSH config setup"
+        return 0
+    fi
+
+    # Resolve the operator's actual primary group — don't assume it matches
+    # $DEV_USER. Most distros use user-private-groups (e.g. puma:puma), but
+    # systems provisioned with a shared primary group (e.g. puma:users)
+    # would break a hardcoded "$DEV_USER:$DEV_USER" chown, and SSH rejects
+    # config/dir ownership mismatches.
+    operator_group=$(id -gn "$DEV_USER" 2>/dev/null)
+    if [[ -z "$operator_group" ]]; then
+        log_warn "Could not resolve primary group for '$DEV_USER', skipping operator SSH config setup"
         return 0
     fi
 
@@ -292,12 +306,29 @@ setup_operator_ssh_config() {
     local marker_begin="# BEGIN skyy-net installer managed block"
     local marker_end="# END skyy-net installer managed block"
 
+    # Reject pre-existing symlinks at our write targets — this script runs
+    # as root, so following a symlink planted under $operator_home could
+    # redirect writes to an arbitrary path (e.g. /root/.ssh/config). On a
+    # fresh-VM bootstrap this is unlikely, but the check is cheap and
+    # prevents the foot-gun outright.
+    if [[ -L "$operator_ssh_dir" ]]; then
+        log_warn "$operator_ssh_dir is a symlink — refusing to write to it, skipping operator SSH config setup"
+        return 0
+    fi
+    if [[ -L "$operator_ssh_config" ]]; then
+        log_warn "$operator_ssh_config is a symlink — refusing to write to it, skipping operator SSH config setup"
+        return 0
+    fi
+
+    # ---------------------------------------------------------------------
+    # Write phase: create dir/file and append the managed block
+    # ---------------------------------------------------------------------
     # Ensure ~/.ssh/ exists with mode 0700 and correct ownership
     if [[ ! -d "$operator_ssh_dir" ]]; then
         log_info "Creating $operator_ssh_dir (mode 0700)"
         mkdir -p "$operator_ssh_dir"
         chmod 0700 "$operator_ssh_dir"
-        chown "$DEV_USER:$DEV_USER" "$operator_ssh_dir"
+        chown "$DEV_USER:$operator_group" "$operator_ssh_dir"
     else
         log_info "$operator_ssh_dir already exists"
     fi
@@ -307,12 +338,24 @@ setup_operator_ssh_config() {
         log_info "Creating $operator_ssh_config (mode 0600)"
         touch "$operator_ssh_config"
         chmod 0600 "$operator_ssh_config"
-        chown "$DEV_USER:$DEV_USER" "$operator_ssh_config"
+        chown "$DEV_USER:$operator_group" "$operator_ssh_config"
     fi
 
-    # Idempotency: if our marker block is already present, skip.
-    if grep -qF "$marker_begin" "$operator_ssh_config"; then
+    # Idempotency: if our marker block is already present, skip. If the
+    # begin marker is present but the end marker is missing, the operator
+    # (or a previous failed run) left the block half-removed — warn rather
+    # than silently duplicate or silently skip.
+    local has_begin has_end
+    grep -qF "$marker_begin" "$operator_ssh_config" && has_begin=1 || has_begin=0
+    grep -qF "$marker_end" "$operator_ssh_config" && has_end=1 || has_end=0
+
+    if [[ $has_begin -eq 1 && $has_end -eq 1 ]]; then
         log_info "Wildcard *-github alias block already present in $operator_ssh_config (idempotent: skipping)"
+    elif [[ $has_begin -eq 1 && $has_end -eq 0 ]]; then
+        log_warn "Found BEGIN marker but no END marker in $operator_ssh_config"
+        log_warn "  The managed block appears to have been partially deleted."
+        log_warn "  Please remove everything from the BEGIN marker onward and re-run the installer."
+        log_warn "  Skipping to avoid duplicating or corrupting the block."
     else
         log_info "Appending wildcard *-github alias block to $operator_ssh_config"
         # Leading blank line keeps our block visually separated from any
@@ -334,7 +377,7 @@ EOF
         # Re-assert perms/ownership after write (appending can leave
         # intermediate state if the operator's umask is unusual).
         chmod 0600 "$operator_ssh_config"
-        chown "$DEV_USER:$DEV_USER" "$operator_ssh_config"
+        chown "$DEV_USER:$operator_group" "$operator_ssh_config"
         log_info "Wildcard *-github alias block appended"
     fi
 
@@ -450,10 +493,20 @@ install_helm() {
 
     log_info "Installing helm via official get-helm-3 script..."
 
-    local installer_script="/tmp/get-helm-3.sh"
+    # Use mktemp to avoid a predictable-path race on /tmp — another
+    # process could race to replace a fixed-path tempfile between the
+    # curl write and the execute, and since we run as root, that's a
+    # privilege-escalation vector. mktemp gives us a unique, unpredictable
+    # path with 0600 perms out of the box.
+    local installer_script
+    installer_script=$(mktemp /tmp/get-helm-3-XXXXXX.sh) || {
+        log_error "Failed to create tempfile for helm installer"
+        return 1
+    }
     if ! curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
             -o "$installer_script"; then
         log_error "Failed to download helm install script"
+        rm -f "$installer_script"
         return 1
     fi
     chmod 700 "$installer_script"
