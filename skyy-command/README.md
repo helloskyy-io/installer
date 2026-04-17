@@ -14,15 +14,17 @@ curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/skyy-co
 
 The public installer script performs the following steps:
 
-1. **Setup folder structure and user group** - Creates `/opt/skyy-net` and `skyy-net` group
-2. **Install Docker** - Installs Docker and Docker Compose
-3. **Install Git** - Ensures Git is available and configures git identity
-4. **Configure deploy key** - Generates SSH deploy key for skyy-command repository access
+1. **Setup folder structure and user group** - Creates `/opt/skyy-net` and `skyy-net` group; auto-detects the invoking operator via `$SUDO_USER` and adds them to the group with POSIX default ACLs
+2. **Configure operator SSH config** - Appends a wildcard `Host *-github` block (managed via BEGIN/END markers) to `~<operator>/.ssh/config` so per-MDC and per-repo aliases created later by Genesis just work from the operator's shell
+3. **Install Docker** - Installs Docker and Docker Compose
+4. **Install Helm** - Installs helm (required by the private bootstrap's chart-rendering pipeline)
+5. **Install Git** - Ensures Git is available and configures git identity
+6. **Configure deploy key** - Generates SSH deploy key for skyy-command repository access
    - **Manual step required**: Script displays the public key and prompts you to add it to GitHub
    - Add the deploy key to: `https://github.com/helloskyy-io/Skyy-Command/settings/keys` (Deploy keys section)
    - **Important**: Give the key **read access** (write access not needed for bootstrap)
-5. **Clone repository** - Clones skyy-command repository using the deploy key
-6. **Launch private bootstrap** - Executes the private bootstrap script from skyy-command to complete Temporal setup
+7. **Clone repository** - Clones skyy-command repository using the deploy key
+8. **Launch private bootstrap** - Executes the private bootstrap script from skyy-command to complete Temporal setup
 
 ## Requirements
 
