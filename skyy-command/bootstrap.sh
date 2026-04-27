@@ -459,13 +459,44 @@ install_docker() {
         log_warn "Docker Compose plugin not found, attempting to install..."
         apt-get update
         apt-get install -y docker-compose-plugin
-        
+
         if docker compose version &> /dev/null; then
             log_info "Docker Compose installed successfully: $(docker compose version)"
         else
             log_error "Docker Compose installation failed"
             return 1
         fi
+    fi
+
+    # Add operator to the docker group.
+    #
+    # Why: operators run `docker build` against worker Dockerfiles during the
+    # transitional period before Harbor lands (Sprint 2-5). Per the [Worker
+    # Deployment Standard §4.4], images are built on the control-plane VM and
+    # imported into K3s containerd via `k3s ctr images import` until Harbor
+    # provides a registry. After Harbor, local image builds remain useful for
+    # development iteration (Dockerfile changes, debugging). Without docker
+    # group membership, every `docker` invocation requires sudo — friction
+    # that compounds across iterations.
+    #
+    # Security note: docker group membership is effectively root (any member
+    # can `docker run -v /:/host` and own the host). The operator already has
+    # sudo, so adding docker group does NOT expand their privilege — it just
+    # removes the sudo keystroke for the docker workflow.
+    if id "$DEV_USER" &>/dev/null; then
+        if groups "$DEV_USER" | grep -q "\bdocker\b"; then
+            log_info "User '$DEV_USER' is already in group 'docker'"
+        else
+            log_info "Adding user '$DEV_USER' to group 'docker'"
+            usermod -aG docker "$DEV_USER" || {
+                log_error "Failed to add user '$DEV_USER' to group 'docker'"
+                return 1
+            }
+            log_info "User '$DEV_USER' added to group 'docker'"
+            log_warn "User '$DEV_USER' may need to log out and back in (or run 'newgrp docker') for group changes to take effect"
+        fi
+    else
+        log_warn "User '$DEV_USER' does not exist, skipping docker group assignment"
     fi
 }
 
