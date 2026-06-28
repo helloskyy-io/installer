@@ -952,6 +952,27 @@ launch_private_bootstrap() {
 }
 
 # Main execution
+ensure_qemu_guest_agent() {
+    # The control-plane seed is the ONE VM built by hand (not cloned from a DAS
+    # golden template), so it's the only VM that doesn't inherit the universal
+    # qemu-guest-agent requirement (DAS Template Standard §2). Install it here so
+    # the seed matches the fleet — enables Proxmox-side management + consistent
+    # (fs-freeze) PBS backups of the control plane. Non-fatal: bootstrap does not
+    # depend on it.
+    #
+    # NOTE: the in-guest package alone is NOT enough — the Proxmox `agent: 1` flag
+    # must be set at VM-CREATE time (operator: `qm set <vmid> --agent 1`) so the
+    # virtio-serial channel exists from first boot. Set it when creating the seed.
+    if dpkg -s qemu-guest-agent >/dev/null 2>&1; then
+        log_info "qemu-guest-agent already installed"
+    else
+        log_info "Installing qemu-guest-agent (hypervisor integration + backup fs-freeze)..."
+        apt-get update -qq
+        apt-get install -y qemu-guest-agent \
+            || log_warn "qemu-guest-agent install failed (non-fatal; set --agent 1 at VM create + reinstall)"
+    fi
+}
+
 main() {
     log_info "═══════════════════════════════════════════════════════════════"
     log_info "Skyy-Command Public Installer"
@@ -967,6 +988,12 @@ main() {
     log_info "Root access verified"
     echo ""
     
+    # Host prerequisite — qemu-guest-agent (hypervisor integration). The seed is
+    # the one hand-built VM that doesn't inherit it from a DAS golden template.
+    log_info "Ensuring qemu-guest-agent (host prerequisite)..."
+    ensure_qemu_guest_agent
+    echo ""
+
     # Execute tasks in order with detailed error handling
     log_info "Starting installation tasks..."
     echo ""
