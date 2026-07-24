@@ -884,12 +884,27 @@ launch_private_bootstrap() {
     log_info "Preparing to launch private bootstrap script from skyy-command..."
     
     local private_bootstrap="$MDC_REPO_DIR/components/temporal/scripts/bootstrap/bootstrap.sh"
-    
+
     # Verify repository was cloned successfully
     if [[ ! -d "$MDC_REPO_DIR" ]]; then
         log_error "Skyy-Command repository directory not found: $MDC_REPO_DIR"
         log_error "Please ensure the repository was cloned successfully in the previous step"
         return 1
+    fi
+
+    # Install the host Python prerequisites (PyYAML, requests) pinned from the
+    # repo's single constraints authority (Image Pipeline Standard §4.1), so the
+    # private bootstrap's dependency checks pass without ad-hoc apt/pip installs.
+    local host_prereqs="$MDC_REPO_DIR/scripts/install_host_prereqs.sh"
+    if [[ -f "$host_prereqs" ]]; then
+        log_info "Installing host Python prerequisites (pinned via constraints.txt)..."
+        if ! bash "$host_prereqs"; then
+            log_error "Host prerequisite install failed: $host_prereqs"
+            log_error "Fix the error above and re-run; the private bootstrap needs these deps"
+            return 1
+        fi
+    else
+        log_warn "Host-prereqs script not found ($host_prereqs) — older repo revision; continuing"
     fi
     
     # Verify private bootstrap script exists
