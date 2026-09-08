@@ -255,43 +255,106 @@ ensure_base_dir_and_group() {
 #   cred store  -> `-c credential.helper=` neutralises any inherited helper
 # Same shape as skyy-command's _pat_auth.py, in shell, because stage 1 runs
 # before any of that code is on the box.
-ensure_repo_cloned() {
-    # A HALF-CLONE IS THE CASE AN EXISTENCE CHECK MISSES. `git rev-parse` asks
-    # whether this is a working repository, not whether a directory is there.
-    if git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-        log_info "Repository already present and valid at $REPO_DIR"
-        assert_remote_is_clean
-        return 0
-    fi
-    if [[ -e "$REPO_DIR" ]]; then
-        log_warn "$REPO_DIR exists but is not a valid git repository — removing and re-cloning"
-        rm -rf "$REPO_DIR"
-    fi
-
+# The askpass helper, created once so BOTH fetch and clone can use it. The
+# token's VALUE is never in the file — only a reference to the environment.
+make_askpass() {
+    [[ -n "$ASKPASS_DIR" ]] && return 0
     ASKPASS_DIR="$(mktemp -d)"; chmod 700 "$ASKPASS_DIR"
-    local askpass="${ASKPASS_DIR}/askpass.sh"
-    cat > "$askpass" <<'ASKPASS'
+    cat > "${ASKPASS_DIR}/askpass.sh" <<'ASKPASS'
 #!/usr/bin/env bash
-# The token's VALUE is not in this file — only a reference to the environment.
 case "$1" in
     Username*) echo "x-access-token" ;;
     *)         echo "${IMAGE_MANAGER_PAT_INTERNAL}" ;;
 esac
 ASKPASS
-    chmod 700 "$askpass"
+    chmod 700 "${ASKPASS_DIR}/askpass.sh"
+}
 
-    log_info "Cloning ${REPO_OWNER}/${REPO_NAME} (${REPO_REF})..."
-    if ! IMAGE_MANAGER_PAT_INTERNAL="$PAT" GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
-         git -c credential.helper= clone --branch "$REPO_REF" \
+# Runs git with the token supplied through GIT_ASKPASS. THE FOUR SURFACES THE
+# TOKEN MUST NOT REACH, and how each is closed:
+#   argv        -> GIT_ASKPASS supplies it; never an argument
+#   remote URL  -> the URL in .git/config carries no credential
+#   .git/config -> follows from the above, and is ASSERTED below
+#   cred store  -> `-c credential.helper=` neutralises any inherited helper
+git_with_token() {
+    make_askpass
+    IMAGE_MANAGER_PAT_INTERNAL="$PAT" GIT_ASKPASS="${ASKPASS_DIR}/askpass.sh" \
+        GIT_TERMINAL_PROMPT=0 git -c credential.helper= "$@"
+}
+
+# PRESENT IS NOT CURRENT, and that is the whole point of this function.
+#
+# An earlier version stopped at "is this a valid git repository?" and returned.
+# That is the same defect as checking a Secret exists without asking whether the
+# token in it still works: it tests the wrong property. A checkout made before
+# the last push is a valid repository AND the wrong code, so the install
+# proceeded against a stale tree and failed on a file that had been pushed
+# hours earlier.
+#
+# The end state is "the repository is present AND at the expected ref", so that
+# is what this converges to.
+ensure_repo_cloned() {
+    if ! git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        if [[ -e "$REPO_DIR" ]]; then
+            log_warn "$REPO_DIR exists but is not a valid git repository — removing and re-cloning"
+            rm -rf "$REPO_DIR"
+        fi
+        log_info "Cloning ${REPO_OWNER}/${REPO_NAME} (${REPO_REF})..."
+        if ! git_with_token clone --branch "$REPO_REF" \
              "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "$REPO_DIR"; then
-        log_error "Clone failed despite a token that validated moments ago."
-        log_error "  Network, or the branch '${REPO_REF}' does not exist."
-        return 1
+            log_error "Clone failed despite a token that validated moments ago."
+            log_error "  Network, or the branch '${REPO_REF}' does not exist."
+            return 1
+        fi
+        assert_remote_is_clean
+        fix_repo_ownership
+        log_info "Clone complete"
+        return 0
     fi
+
+    log_info "Repository present — checking it is current..."
     assert_remote_is_clean
+
+    if ! git_with_token -C "$REPO_DIR" fetch --quiet origin "$REPO_REF"; then
+        log_warn "Could not reach the remote — continuing with the checkout as it stands"
+        return 0
+    fi
+
+    local local_sha remote_sha
+    local_sha="$(git -C "$REPO_DIR" rev-parse HEAD)"
+    remote_sha="$(git -C "$REPO_DIR" rev-parse FETCH_HEAD)"
+
+    if [[ "$local_sha" == "$remote_sha" ]]; then
+        log_info "Already current at ${local_sha:0:8}"
+        fix_repo_ownership
+        return 0
+    fi
+
+    # NEVER DESTROY LOCAL WORK. This box is an install target and may also be
+    # where someone is editing. A fast-forward is safe; anything else is the
+    # operator's call, and a warning they can act on beats a reset they cannot
+    # undo.
+    if [[ -n "$(git -C "$REPO_DIR" status --porcelain)" ]]; then
+        log_warn "Local changes present — NOT updating, and not discarding them."
+        log_warn "  HEAD ${local_sha:0:8}, remote ${remote_sha:0:8}."
+        log_warn "  Commit or stash them, then re-run."
+        return 0
+    fi
+
+    if git -C "$REPO_DIR" merge-base --is-ancestor HEAD FETCH_HEAD 2>/dev/null; then
+        log_info "Behind by $(git -C "$REPO_DIR" rev-list --count HEAD..FETCH_HEAD) commit(s) — fast-forwarding to ${remote_sha:0:8}"
+        git -C "$REPO_DIR" merge --ff-only --quiet FETCH_HEAD
+        fix_repo_ownership
+        log_info "Now current at $(git -C "$REPO_DIR" rev-parse --short HEAD)"
+    else
+        log_warn "Local HEAD has diverged from ${REPO_REF} — NOT updating."
+        log_warn "  HEAD ${local_sha:0:8}, remote ${remote_sha:0:8}. Resolve by hand, then re-run."
+    fi
+}
+
+fix_repo_ownership() {
     chgrp -R "$GROUP_NAME" "$REPO_DIR" 2>/dev/null || true
     chmod -R g+rwX "$REPO_DIR" 2>/dev/null || true
-    log_info "Clone complete"
 }
 
 # Asserted rather than assumed: a token in .git/config is exactly the durable

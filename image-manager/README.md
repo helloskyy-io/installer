@@ -135,9 +135,15 @@ hold it.
 
 Every task converges rather than skips — it asks *"is the end state true?"* and makes it true if
 not. It never asks *"does this artifact exist?"* and step over, because that cannot repair a
-half-made artifact: **a clone that died mid-transfer leaves a `.git` directory that passes an
-existence check and breaks everything after it.** This script checks whether git considers the
-directory a working repository, and re-clones if not.
+half-made artifact.
+
+**For the repository, the end state is present AND current** — not merely present. A checkout made
+before the last push is a perfectly valid git repository and the wrong code, so the script fetches
+and fast-forwards. **It will not destroy local work:** if the tree is dirty or HEAD has diverged, it
+says so and leaves it alone for you to resolve.
+
+A directory that exists but is not a valid repository — a clone that died mid-transfer — is removed
+and re-cloned.
 
 The same applies to the credential. The repository being present says nothing about whether a
 usable token exists, so the two are decided independently.
