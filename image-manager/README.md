@@ -14,6 +14,70 @@ credential. A stage-1 script inside the repo it clones is a circle.
 
 ---
 
+## Before you run it — the VM
+
+This tier is **hand-installed once, by a human, and is never a target of automated standup.** That
+is the rule the whole component exists to honour: it is the registry every other product pulls its
+images from, so instance zero cannot be installed by pulling an image.
+
+**It assumes a rented VM and nothing else** — no hypervisor, no host agent, no platform underneath.
+We run instance zero on our own hardware because we own it, not because it needs to be there.
+
+### Size
+
+| Resource | | Why |
+|---|---|---|
+| **8 vCPU** | | A container build is CPU-bound. Harbor wants ~4 at its recommended tier; the build needs room without competing with a pull. |
+| **16 GB RAM** | | Harbor ~8 GB, k3s + containerd ~1.5, Temporal 2–4, PostgreSQL ~2, the worker ~1, plus build headroom. Steady state lands near 15. |
+| **100 GB root** | | OS, k3s, containerd, build scratch. **Rebuildable from this document** — nothing irreplaceable lives here. |
+| **250 GB data volume** | **separate disk, mounted at `/data`** | Registry storage and PostgreSQL. **This is the one that must survive a host reinstall**, and it must be growable without one. |
+
+**250 GB is a starting figure, not a sized one.** A registry's disk only goes up — every published
+tag stays until something reaps it, and nothing reaps anything yet. **Growing a volume is routine;
+shrinking one is involved**, so the cheap mistake is starting small. Start here, watch what it
+actually holds, and grow it.
+
+### Why two volumes and not one
+
+Root can be rebuilt from scratch by re-running the installer. **The data volume cannot** — it holds
+the images every other product pulls, and losing it is losing the artifacts themselves. Keeping them
+apart is what makes "rebuild the box" a routine operation rather than a data-loss event.
+
+**Local storage, deliberately not Ceph.** A registry serves large blobs and a builder writes them;
+both want the disk directly. The requirement is *a volume that survives a host reinstall*, and local
+storage plus off-host backup satisfies it. Ceph is revisitable later without redesigning anything.
+
+### Preparing the data volume
+
+Confirm the second disk is present and empty — `sdb` below, 250 G, with no filesystem and no
+mountpoint:
+
+```bash
+lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT
+```
+
+Then create a filesystem on it and mount it permanently:
+
+```bash
+sudo mkfs.ext4 -L image-manager-data /dev/sdb && sudo mkdir -p /data && echo 'LABEL=image-manager-data /data ext4 defaults,noatime 0 2' | sudo tee -a /etc/fstab && sudo mount -a && df -h /data
+```
+
+**Mounted by LABEL, not by `/dev/sdb`.** Device names reorder across reboots, and a wrong-disk mount
+on the box everything pulls from is not a failure you want to debug at 3am.
+
+**No partition table, deliberately.** Growing later is then a disk resize on the hypervisor followed
+by `resize2fs /dev/sdb` — with no partition edge to move first.
+
+### Other requirements
+
+- **Debian or Ubuntu.** The installer uses `apt-get`; that is its only environmental assumption.
+- **Root, via `sudo`.** The install writes `/etc/rancher`, `/var/lib` and systemd units.
+- **Outbound HTTPS** to `github.com` and `get.k3s.io`.
+- **Back the data volume up off-host.** Nothing in this component does it for you, and the backup is
+  what makes the hand-install rule survivable.
+
+---
+
 ## Before you run it — create the token
 
 The installer clones one private repository, so it needs one read-only credential. **It will not
