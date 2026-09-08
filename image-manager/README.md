@@ -98,15 +98,25 @@ human is present: an exported secret is a secret in your shell history.**
 
 | # | Step |
 |---|---|
-| 1 | `qemu-guest-agent` — so the hypervisor can see and quiesce the VM |
+| 1 | Decides whether a token is needed, and asks only if it is |
 | 2 | `/opt/skyy-net` and the `skyy-net` group, with a default ACL; adds the invoking user |
 | 3 | `git` |
 | 4 | Clones `image-manager` over HTTPS using the token |
 | 5 | Hands off to `/opt/skyy-net/image-manager/bootstrap.sh` |
 
-**No Docker. No SSH key. No Helm. No manual pause.** Each of those is a deliberate departure from
-the `skyy-command` installer beside it — this tier forbids a Docker daemon outright, one token
-replaces the per-repository key scheme, and stage 2 installs Helm because stage 2 is what uses it.
+**No Docker. No SSH key. No Helm. No hypervisor guest agent. No manual pause.** Each is a deliberate
+departure from the `skyy-command` installer beside it.
+
+**The guest agent is the one worth explaining, because its absence is a security ruling.** A
+qemu-guest-agent is a channel *from* the hypervisor *into* the guest — it can execute commands and
+read the filesystem. That is defensible on a box we own and manage; **shipping it to an operator's
+VM is a back door we put there.** This tier is a product other people will run, so the installer
+never places one. If our own instance wants an agent for our convenience, the MDC hosting it
+installs it — that is the hypervisor's business, not this product's.
+
+**It assumes a rented VM and nothing else** — no hypervisor, no host agent, no platform underneath.
+We happen to run instance zero on MDC1 because we own that hardware, but it installs the same way on
+a VPS from anyone. The only environmental assumption is Debian or Ubuntu, for `apt-get`.
 
 ### What happens to the token
 

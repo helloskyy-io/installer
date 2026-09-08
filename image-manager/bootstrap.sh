@@ -19,6 +19,19 @@
 # pulls its images FROM. Instance zero cannot be installed by pulling an image,
 # because at that moment there is no registry. Source and packages only.
 #
+# IT ASSUMES A RENTED VM AND NOTHING ELSE. No hypervisor, no host agent, no
+# platform underneath. We happen to run instance zero on MDC1 because we own
+# that hardware, but this tier belongs to no ecosystem and installs the same way
+# on a VPS from anyone.
+#
+#   NO QEMU-GUEST-AGENT, AND THAT IS A SECURITY RULING RATHER THAN A TRIM. A
+#   guest agent is a channel FROM the hypervisor INTO the guest — it can execute
+#   commands and read the filesystem. Installing one is defensible on a box we
+#   own and manage; shipping it to an operator's VM is a back door we put there.
+#   This tier is a product other people will run, so the installer must never
+#   place one. If OUR instance wants an agent for OUR convenience, the MDC that
+#   hosts it installs it — that is the hypervisor's business, not this product's.
+#
 # IT CONVERGES; IT DOES NOT SKIP. Every task asks "is the end state true?" and
 # makes it true if not. It never asks "does the artifact exist?" and step over.
 # The difference is not stylistic: a clone that died mid-transfer leaves a
@@ -192,20 +205,6 @@ resolve_pat() {
 # Converging tasks — each asks "is the end state true?", never "does it exist?"
 # ---------------------------------------------------------------------------
 
-ensure_qemu_guest_agent() {
-    if systemctl is-active --quiet qemu-guest-agent 2>/dev/null; then
-        log_info "qemu-guest-agent running"
-        return 0
-    fi
-    log_info "Installing qemu-guest-agent..."
-    apt-get update -qq
-    apt-get install -y qemu-guest-agent >/dev/null || {
-        log_warn "qemu-guest-agent unavailable — continuing, it is a hypervisor convenience"
-        return 0
-    }
-    systemctl enable --now qemu-guest-agent || log_warn "Could not start qemu-guest-agent"
-}
-
 ensure_acl() {
     command -v setfacl >/dev/null 2>&1 && return 0
     log_info "Installing 'acl' (provides setfacl)..."
@@ -330,11 +329,10 @@ main() {
     echo ""
     check_root
 
-    log_info "[1/5] deciding whether a token is needed..."; resolve_pat            ; echo ""
-    log_info "[2/5] hypervisor guest agent..."            ; ensure_qemu_guest_agent; echo ""
-    log_info "[3/5] base directory and group..."          ; ensure_base_dir_and_group; echo ""
-    log_info "[4/5] git..."                               ; ensure_git             ; echo ""
-    log_info "[5/5] repository..."                        ; ensure_repo_cloned     ; echo ""
+    log_info "[1/4] deciding whether a token is needed..."; resolve_pat              ; echo ""
+    log_info "[2/4] base directory and group..."          ; ensure_base_dir_and_group; echo ""
+    log_info "[3/4] git..."                               ; ensure_git               ; echo ""
+    log_info "[4/4] repository..."                        ; ensure_repo_cloned       ; echo ""
     hand_off_to_stage_2
 }
 
