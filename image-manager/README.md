@@ -79,13 +79,20 @@ for needing no organisation policy at all.
 ## Run it
 
 ```bash
-export IMAGE_MANAGER_PAT=github_pat_your_token_here
-curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/image-manager/bootstrap.sh | sudo -E bash
+curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/image-manager/bootstrap.sh | sudo bash
 ```
 
-**`sudo -E` is not optional.** Without `-E`, sudo strips the environment and the token does not
-reach the script. It checks for the token before doing anything, so you get an error rather than a
-half-installed box.
+**Nothing is typed on the command line, so nothing lands in shell history.** The script asks for the
+token — input hidden — and only if it actually needs one.
+
+**It asks only when the answer to one question is no:** *is there a usable token already in the k3s
+Secret?* On a fresh VM there is no cluster, so it asks. On a re-run where the stored token still
+works, it does not. **A stored token that has EXPIRED counts as "no"** — presence is not validity,
+and a fine-grained token dies at 366 days.
+
+For an unattended re-run, `IMAGE_MANAGER_PAT` in the environment short-circuits the prompt — never
+the check — and then `sudo -E` is required so the variable survives. **Prefer the prompt when a
+human is present: an exported secret is a secret in your shell history.**
 
 ### What it does
 
@@ -114,7 +121,16 @@ hold it.
 
 ### Re-running it
 
-Safe. The clone step leaves an existing checkout alone; the rest are idempotent.
+**Always safe, from any state, and you never have to work out which stage failed.**
+
+Every task converges rather than skips — it asks *"is the end state true?"* and makes it true if
+not. It never asks *"does this artifact exist?"* and step over, because that cannot repair a
+half-made artifact: **a clone that died mid-transfer leaves a `.git` directory that passes an
+existence check and breaks everything after it.** This script checks whether git considers the
+directory a working repository, and re-clones if not.
+
+The same applies to the credential. The repository being present says nothing about whether a
+usable token exists, so the two are decided independently.
 
 ---
 

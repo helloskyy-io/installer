@@ -18,11 +18,11 @@ See [skyy-command/README.md](./skyy-command/README.md) for detailed documentatio
 token created before you run anything, and the permissions UI is not self-explanatory.
 
 ```bash
-export IMAGE_MANAGER_PAT=github_pat_your_token_here
-curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/image-manager/bootstrap.sh | sudo -E bash
+curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/image-manager/bootstrap.sh | sudo bash
 ```
 
-`sudo -E` is required — without it the token does not reach the script.
+It prompts for the token, hidden, and only when it needs one — nothing on the command line, nothing
+in shell history.
 
 
 ## License

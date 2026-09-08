@@ -1,60 +1,62 @@
 #!/usr/bin/env bash
 #
-# image-manager — public installer (Stage 1 of 3)
+# image-manager — public installer (stage 1 of 3)
 #
 # WHAT THIS IS. The first of three stages that stand up an image-manager
-# instance. Its entire job is to get this repository onto a bare VM and hand
-# off. It installs nothing the tier runs on.
+# instance. Its job is to get this repository onto a bare VM and hand off.
 #
-#   Stage 1  THIS FILE          bare VM  ->  source on disk
-#   Stage 2  <repo>/bootstrap.sh  source  ->  k3s + Temporal + a worker image
-#   Stage 3  Genesis (Temporal)   that    ->  Harbor, the edge, the build path
+#   Stage 1  THIS FILE            bare VM  ->  source at /opt/skyy-net/image-manager
+#   Stage 2  <repo>/bootstrap.sh  source   ->  k3s + Temporal + a worker image
+#   Stage 3  Genesis (Temporal)   that     ->  Harbor, the public edge, the build path
 #
-# WHY IT LIVES HERE AND NOT IN image-manager. This script is what FETCHES
-# image-manager, so it must be reachable by a machine that does not have
-# image-manager yet — a public URL, no credential. A stage-1 script inside the
-# repository it clones is a circle.
+# WHY IT LIVES IN A PUBLIC REPO. This script is what FETCHES image-manager, and
+# image-manager is private. If this script lived there too, you would need the
+# token at `curl` time — which means the token on a command line, which means the
+# token in shell history. **Being public is what lets it ASK for the credential
+# instead of being handed one**, and that is the whole reason for the split.
 #
 # WHY IT MAY NOT PULL AN IMAGE. image-manager is the tier every other product
-# pulls its images FROM. Instance zero therefore cannot be installed by pulling
-# an image, because at that moment there is no registry to pull from. That
-# asymmetry is the component's defining constraint, and this script is where it
-# is first honoured: source and packages only, no artifact from this tier.
+# pulls its images FROM. Instance zero cannot be installed by pulling an image,
+# because at that moment there is no registry. Source and packages only.
 #
-# WHAT IT DELIBERATELY DOES NOT DO, and each is a departure from its sibling
-# `skyy-command/bootstrap.sh` rather than an oversight:
+# IT CONVERGES; IT DOES NOT SKIP. Every task asks "is the end state true?" and
+# makes it true if not. It never asks "does the artifact exist?" and step over.
+# The difference is not stylistic: a clone that died mid-transfer leaves a
+# `.git` directory that passes an existence check and fails everything after it.
+# Re-running this command is always correct, from any state.
 #
-#   * NO Docker.  image-manager runs containerd only and builds daemonlessly
-#     with host-side buildah. A Docker daemon on this box is forbidden outright,
-#     so installing one here would have to be undone by stage 2.
-#   * NO SSH deploy key, and NO `Host *-github` wildcard block.  A deploy key is
-#     per-repository, which is why the sibling needs a keypair and an alias for
-#     each repo it clones and a manual "paste this into GitHub, then press
-#     ENTER" pause in the middle of an install. One fine-grained token replaces
-#     the whole scheme, and this tier clones exactly ONE repository anyway.
-#   * NO Helm.  Stage 2 installs it, because stage 2 is what uses it.
-#   * NO manual pause.  Given the token, this runs start to finish unattended.
+# THE TOKEN, AND THE ONE QUESTION THAT DECIDES IT. A GitHub fine-grained PAT,
+# read-only (`contents: read` + `metadata: read`), scoped to
+# helloskyy-io/image-manager.
 #
-# THE TOKEN. A GitHub fine-grained personal access token, read-only
-# (`contents: read` + `metadata: read`), scoped to helloskyy-io/image-manager.
+#   The operator is asked for it only when it is NEEDED, and need is decided by
+#   ONE question that can be answered without a token: **is there a usable one
+#   already in the k3s Secret?**
 #
-#   IT IS HELD TRANSIENTLY AND NEVER COMES TO REST. It is read from the
-#   environment, used for one clone, and gone when this process exits. It is
-#   never written to a file, never placed in the remote URL, never left in
-#   .git/config, and never passed on a command line where `ps` could read it —
-#   git receives it through GIT_ASKPASS, which is the only mechanism here that
-#   satisfies all four. The repository's Credential Lifecycle addendum requires
-#   this; the same shape is why `git -c credential.helper=` appears below.
+#       no k3s yet             -> needed -> prompt
+#       k3s, no Secret         -> needed -> prompt
+#       Secret, token rejected -> needed -> prompt   <- the 366-day expiry case
+#       Secret, token works    -> not needed, never prompt
 #
-#   Stage 2 places the durable copy into a k3s Secret, once there is a cluster
-#   encrypted at rest to hold it. Nothing durable exists at stage 1, which is
-#   exactly why nothing durable is written here.
+#   PRESENCE IS NOT VALIDITY, and that distinction is load-bearing. A
+#   fine-grained PAT expires after at most 366 days. On that day the Secret
+#   still exists and the token in it is dead — a presence check says "skip" and
+#   the install proceeds with a credential GitHub rejects, failing later
+#   somewhere unrelated. Only asking GitHub catches it.
+#
+#   IT NEVER COMES TO REST. Read from the environment or from the terminal,
+#   held in a shell variable, passed to the child in its environment. Never
+#   written to a file, never in a remote URL, never in `.git/config`, never on a
+#   command line where `ps` can read it, and never echoed.
 #
 # USAGE
-#   export IMAGE_MANAGER_PAT=github_pat_...
-#   curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/image-manager/bootstrap.sh | sudo -E bash
+#   curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/image-manager/bootstrap.sh | sudo bash
 #
-#   `sudo -E` matters: without it the token does not survive into this process.
+#   It prompts for the token if it needs one. **Nothing is typed on the command
+#   line, so nothing lands in shell history.**
+#
+#   For an unattended re-run, `IMAGE_MANAGER_PAT` in the environment
+#   short-circuits the PROMPT — never the check — and needs `sudo -E`.
 
 set -euo pipefail
 
@@ -67,179 +69,248 @@ REPO_REF="${REPO_REF:-main}"
 GIT_USER_NAME="${GIT_USER_NAME:-Skyy Net}"
 GIT_USER_EMAIL="${GIT_USER_EMAIL:-info@helloskyy.io}"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+# Where stage 2 puts the durable copy. Stage 1 only READS this, to decide
+# whether it must ask. Kept in sync with bootstrap.sh by name, deliberately —
+# stage 1 cannot import anything from a repo it has not cloned yet.
+PAT_SECRET_NS="${PAT_SECRET_NS:-image-manager}"
+PAT_SECRET_NAME="${PAT_SECRET_NAME:-repo-read-pat}"
+PAT_SECRET_KEY="${PAT_SECRET_KEY:-token}"
 
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-# The askpass helper is written to a mode-0700 file in a private temp dir and
-# shredded on exit. It echoes an ENV VAR — the token's value is never in the
-# file, so even mid-run the file discloses nothing.
+PAT=""
 ASKPASS_DIR=""
 cleanup() {
-    if [[ -n "$ASKPASS_DIR" && -d "$ASKPASS_DIR" ]]; then
-        rm -rf "$ASKPASS_DIR"
-    fi
+    PAT=""
+    [[ -n "$ASKPASS_DIR" && -d "$ASKPASS_DIR" ]] && rm -rf "$ASKPASS_DIR"
+    return 0
 }
 trap cleanup EXIT
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root (use: sudo -E bash)"
+        log_error "Run as root: curl -fsSL <url> | sudo bash"
         exit 1
     fi
 }
 
-# The token is the ONE thing this script cannot proceed without, and the ONE
-# thing it must not persist. Checked before any side effect, so a missing token
-# costs an error message rather than a half-installed box.
-verify_token_present() {
-    if [[ -z "${IMAGE_MANAGER_PAT:-}" ]]; then
-        log_error "IMAGE_MANAGER_PAT is not set."
-        log_error ""
-        log_error "  A fine-grained GitHub token, READ-ONLY, scoped to"
-        log_error "  ${REPO_OWNER}/${REPO_NAME}: contents:read + metadata:read."
-        log_error ""
-        log_error "  export IMAGE_MANAGER_PAT=github_pat_..."
-        log_error "  ...then re-run with 'sudo -E' so it survives into this process."
-        exit 1
-    fi
-    log_info "Repo-read token present (value never logged, never written to disk)"
+# ---------------------------------------------------------------------------
+# The credential decision
+# ---------------------------------------------------------------------------
+
+# Reads the token out of the k3s Secret if one is there. Empty on any failure —
+# no k3s, no namespace, no Secret, no key. Every one of those means "we do not
+# have a token", which is the only thing the caller needs to know.
+read_pat_from_cluster() {
+    command -v kubectl >/dev/null 2>&1 || return 0
+    [[ -r /etc/rancher/k3s/k3s.yaml ]] || return 0
+    KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n "$PAT_SECRET_NS" \
+        get secret "$PAT_SECRET_NAME" -o "jsonpath={.data.${PAT_SECRET_KEY}}" 2>/dev/null \
+        | base64 -d 2>/dev/null || true
 }
 
-# qemu-guest-agent lets the hypervisor see and quiesce this VM. It is a host
-# prerequisite rather than an image-manager one, which is why it comes first.
+# PRESENCE IS NOT VALIDITY. Asks GitHub whether this token can actually read the
+# repository. 200 means yes. Anything else — expired, revoked, unapproved,
+# wrong scope — means we need a new one, and the operator finds out here rather
+# than three steps later.
+pat_is_usable() {
+    local token="$1" code
+    [[ -n "$token" ]] || return 1
+    code="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 15 \
+        -H "Authorization: Bearer ${token}" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}" 2>/dev/null || echo "000")"
+    [[ "$code" == "200" ]]
+}
+
+# THE ONE QUESTION. Sets PAT, or exits. Order is cheapest-first: an env var
+# costs nothing to check, the cluster costs a kubectl call, and only if both
+# come up empty is a human interrupted.
+resolve_pat() {
+    if [[ -n "${IMAGE_MANAGER_PAT:-}" ]]; then
+        log_info "Token supplied in the environment; validating..."
+        if pat_is_usable "$IMAGE_MANAGER_PAT"; then
+            PAT="$IMAGE_MANAGER_PAT"
+            log_info "Token valid for ${REPO_OWNER}/${REPO_NAME}"
+            return 0
+        fi
+        log_error "IMAGE_MANAGER_PAT is set but cannot read ${REPO_OWNER}/${REPO_NAME}."
+        log_error "  Expired, revoked, awaiting org approval, or missing Contents:Read."
+        exit 1
+    fi
+
+    local existing
+    existing="$(read_pat_from_cluster)"
+    if [[ -n "$existing" ]]; then
+        log_info "Found a token in the k3s Secret; validating..."
+        if pat_is_usable "$existing"; then
+            PAT="$existing"
+            log_info "Stored token is valid — not asking you for one"
+            return 0
+        fi
+        log_warn "The stored token is present but NO LONGER VALID."
+        log_warn "  Fine-grained tokens expire after at most 366 days; this is the usual cause."
+        log_warn "  A new one is needed. Stage 2 will replace the stored copy."
+    fi
+
+    # READ FROM THE TERMINAL, NOT STDIN. Under `curl | bash`, stdin IS the
+    # script — a plain `read` would consume the next lines of this file and
+    # execute nothing. /dev/tty is the operator's keyboard regardless of how
+    # the script arrived.
+    if [[ ! -r /dev/tty ]]; then
+        log_error "A token is needed and there is no terminal to ask on."
+        log_error "  Re-run interactively, or set IMAGE_MANAGER_PAT and use 'sudo -E'."
+        exit 1
+    fi
+
+    echo "" >&2
+    log_info "A GitHub token is needed to clone ${REPO_OWNER}/${REPO_NAME}."
+    log_info "  Fine-grained, READ-ONLY, scoped to that one repository:"
+    log_info "    Contents: Read-only   (Metadata sets itself)"
+    log_info "  See image-manager/README.md in this installer repo for the exact steps."
+    echo "" >&2
+    printf "Paste the token (input hidden): " >&2
+    read -rs PAT < /dev/tty
+    echo "" >&2
+
+    if [[ -z "$PAT" ]]; then
+        log_error "No token entered."
+        exit 1
+    fi
+    if ! pat_is_usable "$PAT"; then
+        log_error "That token cannot read ${REPO_OWNER}/${REPO_NAME}."
+        log_error "  Check: org approval, Contents:Read, and that the repo is selected."
+        exit 1
+    fi
+    log_info "Token valid for ${REPO_OWNER}/${REPO_NAME}"
+}
+
+# ---------------------------------------------------------------------------
+# Converging tasks — each asks "is the end state true?", never "does it exist?"
+# ---------------------------------------------------------------------------
+
 ensure_qemu_guest_agent() {
     if systemctl is-active --quiet qemu-guest-agent 2>/dev/null; then
-        log_info "qemu-guest-agent already running"
+        log_info "qemu-guest-agent running"
         return 0
     fi
     log_info "Installing qemu-guest-agent..."
     apt-get update -qq
-    apt-get install -y qemu-guest-agent || {
-        log_warn "qemu-guest-agent install failed — continuing (not fatal to the install)"
+    apt-get install -y qemu-guest-agent >/dev/null || {
+        log_warn "qemu-guest-agent unavailable — continuing, it is a hypervisor convenience"
         return 0
     }
     systemctl enable --now qemu-guest-agent || log_warn "Could not start qemu-guest-agent"
 }
 
-# Ported from skyy-command/bootstrap.sh Task 0, which had this right. The `acl`
-# dependency is real: setfacl is POSIX-standard and still absent from a fresh
-# Ubuntu Server, and the default ACL is what lets the operator and later
-# processes share the tree without a chmod race.
-setup_folder_and_group() {
-    if ! command -v setfacl >/dev/null 2>&1; then
-        log_info "Installing 'acl' (provides setfacl)..."
-        apt-get update -qq
-        apt-get install -y acl || { log_error "Failed to install 'acl'"; return 1; }
-    fi
-
-    if [[ ! -d "$BASE_DIR" ]]; then
-        log_info "Creating $BASE_DIR"
-        mkdir -p "$BASE_DIR"
-    fi
-
-    if ! getent group "$GROUP_NAME" >/dev/null 2>&1; then
-        log_info "Creating group '$GROUP_NAME'"
-        groupadd "$GROUP_NAME"
-    fi
-
-    # SUDO_USER is the human who invoked sudo; root has no business owning the
-    # tree they will be editing.
-    local operator="${SUDO_USER:-}"
-    if [[ -n "$operator" ]] && id "$operator" >/dev/null 2>&1; then
-        usermod -aG "$GROUP_NAME" "$operator"
-        log_info "Added '$operator' to '$GROUP_NAME'"
-    else
-        log_warn "No SUDO_USER detected — add your operator account to '$GROUP_NAME' by hand"
-    fi
-
-    chgrp -R "$GROUP_NAME" "$BASE_DIR"
-    chmod -R g+rwX "$BASE_DIR"
-    chmod g+s "$BASE_DIR"
-    setfacl -d -m g::rwx "$BASE_DIR" || log_warn "Could not set default ACL on $BASE_DIR"
-    log_info "Folder structure and group ready at $BASE_DIR"
+ensure_acl() {
+    command -v setfacl >/dev/null 2>&1 && return 0
+    log_info "Installing 'acl' (provides setfacl)..."
+    apt-get update -qq
+    apt-get install -y acl >/dev/null || { log_error "Failed to install 'acl'"; return 1; }
 }
 
-install_git() {
+ensure_git() {
     if ! command -v git >/dev/null 2>&1; then
         log_info "Installing git..."
         apt-get update -qq
-        apt-get install -y git || { log_error "Failed to install git"; return 1; }
-    else
-        log_info "git already installed: $(git --version)"
+        apt-get install -y git >/dev/null || { log_error "Failed to install git"; return 1; }
     fi
     git config --global --add safe.directory "$REPO_DIR" 2>/dev/null || true
     git config --global user.name  "$GIT_USER_NAME"  2>/dev/null || true
     git config --global user.email "$GIT_USER_EMAIL" 2>/dev/null || true
+    log_info "git ready: $(git --version)"
 }
 
-# THE CLONE, AND THE FOUR SURFACES THE TOKEN MUST NOT REACH.
-#
-#   argv          -> GIT_ASKPASS supplies it; it is never an argument
-#   the remote    -> the URL committed to .git/config carries no credential
-#   .git/config   -> follows from the above
-#   a credential  -> `-c credential.helper=` neutralises any inherited helper,
-#   store            so nothing is cached to disk
-#
-# This is the shape `skyy-command/lib/temporal/activities/git/_pat_auth.py`
-# arrived at for the same problem. Reproduced here in shell because stage 1 runs
-# before any of that code is on the box.
-clone_repo() {
-    if [[ -d "$REPO_DIR/.git" ]]; then
-        log_info "$REPO_DIR already a git repo — leaving it alone (idempotent)"
-        return 0
+# Four independent end-states, so a box where any one of them is wrong gets
+# repaired rather than stepped over.
+ensure_base_dir_and_group() {
+    ensure_acl
+    [[ -d "$BASE_DIR" ]] || { log_info "Creating $BASE_DIR"; mkdir -p "$BASE_DIR"; }
+    getent group "$GROUP_NAME" >/dev/null 2>&1 || { log_info "Creating group '$GROUP_NAME'"; groupadd "$GROUP_NAME"; }
+
+    local operator="${SUDO_USER:-}"
+    if [[ -n "$operator" ]] && id "$operator" >/dev/null 2>&1; then
+        if ! id -nG "$operator" | tr ' ' '\n' | grep -qx "$GROUP_NAME"; then
+            usermod -aG "$GROUP_NAME" "$operator"
+            log_info "Added '$operator' to '$GROUP_NAME' (new group applies at next login)"
+        fi
+    else
+        log_warn "No SUDO_USER — add your operator account to '$GROUP_NAME' by hand"
     fi
 
-    ASKPASS_DIR="$(mktemp -d)"
-    chmod 700 "$ASKPASS_DIR"
+    chgrp -R "$GROUP_NAME" "$BASE_DIR" 2>/dev/null || true
+    chmod -R g+rwX "$BASE_DIR" 2>/dev/null || true
+    chmod g+s "$BASE_DIR"
+    setfacl -d -m g::rwx "$BASE_DIR" 2>/dev/null || log_warn "Could not set default ACL on $BASE_DIR"
+    log_info "$BASE_DIR ready, group '$GROUP_NAME'"
+}
+
+# THE FOUR SURFACES THE TOKEN MUST NOT REACH, and how each is closed:
+#   argv        -> GIT_ASKPASS supplies it; never an argument
+#   remote URL  -> the URL written to .git/config carries no credential
+#   .git/config -> follows from the above, and is ASSERTED below
+#   cred store  -> `-c credential.helper=` neutralises any inherited helper
+# Same shape as skyy-command's _pat_auth.py, in shell, because stage 1 runs
+# before any of that code is on the box.
+ensure_repo_cloned() {
+    # A HALF-CLONE IS THE CASE AN EXISTENCE CHECK MISSES. `git rev-parse` asks
+    # whether this is a working repository, not whether a directory is there.
+    if git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+        log_info "Repository already present and valid at $REPO_DIR"
+        assert_remote_is_clean
+        return 0
+    fi
+    if [[ -e "$REPO_DIR" ]]; then
+        log_warn "$REPO_DIR exists but is not a valid git repository — removing and re-cloning"
+        rm -rf "$REPO_DIR"
+    fi
+
+    ASKPASS_DIR="$(mktemp -d)"; chmod 700 "$ASKPASS_DIR"
     local askpass="${ASKPASS_DIR}/askpass.sh"
     cat > "$askpass" <<'ASKPASS'
 #!/usr/bin/env bash
-# git asks for a username first, then a password. x-access-token is GitHub's
-# convention for token auth; the token itself comes from the environment.
+# The token's VALUE is not in this file — only a reference to the environment.
 case "$1" in
     Username*) echo "x-access-token" ;;
-    *)         echo "${IMAGE_MANAGER_PAT}" ;;
+    *)         echo "${IMAGE_MANAGER_PAT_INTERNAL}" ;;
 esac
 ASKPASS
     chmod 700 "$askpass"
 
-    log_info "Cloning ${REPO_OWNER}/${REPO_NAME} (${REPO_REF}) into $REPO_DIR..."
-    if ! GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
-         git -c credential.helper= \
-             clone --branch "$REPO_REF" \
+    log_info "Cloning ${REPO_OWNER}/${REPO_NAME} (${REPO_REF})..."
+    if ! IMAGE_MANAGER_PAT_INTERNAL="$PAT" GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+         git -c credential.helper= clone --branch "$REPO_REF" \
              "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "$REPO_DIR"; then
-        log_error "Clone failed."
-        log_error "  Most likely: the token cannot read ${REPO_OWNER}/${REPO_NAME},"
-        log_error "  or the organisation has not approved fine-grained tokens."
+        log_error "Clone failed despite a token that validated moments ago."
+        log_error "  Network, or the branch '${REPO_REF}' does not exist."
         return 1
     fi
-
-    # The stored remote must be credential-free. Asserted rather than assumed:
-    # a token in .git/config is exactly the durable copy this script exists to
-    # avoid, and it would survive every later stage.
-    local origin
-    origin="$(git -C "$REPO_DIR" remote get-url origin)"
-    if [[ "$origin" == *"@"* ]]; then
-        log_error "Stored remote contains a credential — refusing to continue."
-        log_error "  $origin"
-        return 1
-    fi
-
-    chgrp -R "$GROUP_NAME" "$REPO_DIR"
-    chmod -R g+rwX "$REPO_DIR"
-    log_info "Clone complete; stored remote is credential-free"
+    assert_remote_is_clean
+    chgrp -R "$GROUP_NAME" "$REPO_DIR" 2>/dev/null || true
+    chmod -R g+rwX "$REPO_DIR" 2>/dev/null || true
+    log_info "Clone complete"
 }
 
-# Stage 2 lives in the repo we just cloned. Named by path rather than searched
-# for: the sibling installer hands off to a path that moved in April 2026 and
-# fails on every fresh install to this day, so this checks before it execs.
-launch_bootstrap() {
+# Asserted rather than assumed: a token in .git/config is exactly the durable
+# copy this script exists to avoid, and it would outlive every later stage.
+assert_remote_is_clean() {
+    local origin
+    origin="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || echo "")"
+    if [[ "$origin" == *"@"* ]]; then
+        log_error "Stored remote contains a credential — refusing to continue."
+        exit 1
+    fi
+    log_info "Stored remote is credential-free"
+}
+
+# The token reaches stage 2 in its ENVIRONMENT — not a file, not an argument.
+# Stage 2 is what writes the durable copy into a k3s Secret, once a cluster
+# encrypted at rest exists to hold it.
+hand_off_to_stage_2() {
     local next="${REPO_DIR}/bootstrap.sh"
     if [[ ! -f "$next" ]]; then
         log_error "Stage 2 not found at $next"
@@ -249,7 +320,7 @@ launch_bootstrap() {
     chmod +x "$next"
     log_info "Handing off to stage 2: $next"
     echo ""
-    exec "$next"
+    IMAGE_MANAGER_PAT="$PAT" exec "$next"
 }
 
 main() {
@@ -257,17 +328,14 @@ main() {
     log_info "image-manager — public installer (stage 1 of 3)"
     log_info "═══════════════════════════════════════════════════════════════"
     echo ""
-
     check_root
-    verify_token_present
-    echo ""
 
-    log_info "[1/5] qemu-guest-agent..."          ; ensure_qemu_guest_agent ; echo ""
-    log_info "[2/5] folder structure and group..." ; setup_folder_and_group  ; echo ""
-    log_info "[3/5] git..."                        ; install_git            ; echo ""
-    log_info "[4/5] clone ${REPO_NAME}..."         ; clone_repo             ; echo ""
-    log_info "[5/5] hand off to stage 2..."
-    launch_bootstrap
+    log_info "[1/5] deciding whether a token is needed..."; resolve_pat            ; echo ""
+    log_info "[2/5] hypervisor guest agent..."            ; ensure_qemu_guest_agent; echo ""
+    log_info "[3/5] base directory and group..."          ; ensure_base_dir_and_group; echo ""
+    log_info "[4/5] git..."                               ; ensure_git             ; echo ""
+    log_info "[5/5] repository..."                        ; ensure_repo_cloned     ; echo ""
+    hand_off_to_stage_2
 }
 
 main "$@"
