@@ -110,8 +110,8 @@ replaces the per-repository key scheme, and stage 2 installs Helm because stage 
 
 ### What happens to the token
 
-**It is held transiently and never comes to rest.** Read from the environment, used for one clone,
-gone when the process exits. It is never written to a file, never placed in the remote URL, never
+**It is held transiently and never comes to rest.** Read from your terminal (or the environment, if
+you chose that path), held in a shell variable, gone when the process exits. It is never written to a file, never placed in the remote URL, never
 left in `.git/config`, and never passed on a command line — git receives it through `GIT_ASKPASS`.
 The script then **asserts** the stored remote is credential-free rather than assuming it, because a
 token in `.git/config` would survive every later stage.
@@ -136,8 +136,14 @@ usable token exists, so the two are decided independently.
 
 ## Troubleshooting
 
-**`IMAGE_MANAGER_PAT is not set`** — you dropped the `-E` from `sudo -E bash`, or the export was in
-a different shell.
+**It asks for a token when you expected it not to** — the stored one has expired, been revoked, or
+lost org approval. Presence is not validity; it asked GitHub. Create a new token and paste it.
+
+**It does not ask, and you wanted it to** — the token in the k3s Secret is still valid. To force a
+replacement, delete the Secret: `kubectl -n image-manager delete secret repo-read-pat`.
+
+**`there is no terminal to ask on`** — you piped the script somewhere with no TTY. Run it
+interactively, or set `IMAGE_MANAGER_PAT` and use `sudo -E`.
 
 **Clone fails with authentication error** — the token has not been approved by the organisation, or
 `Contents` was left at *No access*, or `image-manager` was not selected under *Only select
