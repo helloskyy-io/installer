@@ -130,12 +130,32 @@ read_pat_from_cluster() {
 # wrong scope — means we need a new one, and the operator finds out here rather
 # than three steps later.
 pat_is_usable() {
-    local token="$1" code
+    local token="$1" code cfgdir
     [[ -n "$token" ]] || return 1
+
+    # THE TOKEN GOES IN A CONFIG FILE, NOT ON THE COMMAND LINE. `-H "Authorization:
+    # Bearer $token"` puts the credential in /proc/<pid>/cmdline, where any local
+    # process can read it for as long as curl runs -- the surface Credential
+    # Lifecycle §2.6 invariant 2 forbids BY NAME, and the one requirement 6 of
+    # this phase is written about. `--config` is read by curl and by nothing else.
+    #
+    # THIS WAS A REAL LEAK, NOT A HYPOTHETICAL ONE. It shipped, ran on instance
+    # zero, and was found on 2026-09-09 by the first run of
+    # test/canary_credential_surfaces.sh -- which is the entire argument for
+    # having written that test.
+    cfgdir="$(mktemp -d)" || return 1
+    chmod 700 "$cfgdir"
+    printf 'header = "Authorization: Bearer %s"\n' "$token" > "${cfgdir}/curlrc"
+    chmod 600 "${cfgdir}/curlrc"
+
     code="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 15 \
-        -H "Authorization: Bearer ${token}" \
+        --config "${cfgdir}/curlrc" \
         -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}" 2>/dev/null || echo "000")"
+
+    # Shredded on every path out, including the failure paths above this line
+    # having already returned -- which is why the directory is created late.
+    rm -rf "$cfgdir"
     [[ "$code" == "200" ]]
 }
 
