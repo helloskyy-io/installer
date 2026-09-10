@@ -143,8 +143,20 @@ pat_is_usable() {
     # zero, and was found on 2026-09-09 by the first run of
     # test/canary_credential_surfaces.sh -- which is the entire argument for
     # having written that test.
-    cfgdir="$(mktemp -d)" || return 1
+    # /run, NOT /tmp, AND THE DIFFERENCE IS THE STANDARD'S POINT.
+    # Credential Lifecycle §2.6 invariant 1 requires a transient credential to
+    # sit on a "tmpfs / memory-backed file (e.g. /run); NEVER persistent disk".
+    # `mktemp -d` honours $TMPDIR and otherwise lands in /tmp -- the root
+    # filesystem. The argv leak fixed on 2026-09-09 was moved straight onto the
+    # medium the same invariant forbids, which is half a fix.
+    #
+    # AND THE SCRUB IS A TRAP, NOT A LINE. A single `rm` at the end runs only on
+    # the success path; `set -euo pipefail` is in force and `curl --max-time 15`
+    # is a realistic place for an operator to press Ctrl-C. The trap covers the
+    # interrupt, the error exit, and the return.
+    cfgdir="$(mktemp -d -p /run)" || return 1
     chmod 700 "$cfgdir"
+    trap 'rm -rf "$cfgdir"' RETURN INT TERM
     printf 'header = "Authorization: Bearer %s"\n' "$token" > "${cfgdir}/curlrc"
     chmod 600 "${cfgdir}/curlrc"
 
@@ -153,9 +165,6 @@ pat_is_usable() {
         -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}" 2>/dev/null || echo "000")"
 
-    # Shredded on every path out, including the failure paths above this line
-    # having already returned -- which is why the directory is created late.
-    rm -rf "$cfgdir"
     [[ "$code" == "200" ]]
 }
 
