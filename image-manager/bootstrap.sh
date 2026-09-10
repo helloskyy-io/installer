@@ -130,42 +130,40 @@ read_pat_from_cluster() {
 # wrong scope — means we need a new one, and the operator finds out here rather
 # than three steps later.
 pat_is_usable() {
-    local token="$1" code cfgdir
+    local token="$1" code
     [[ -n "$token" ]] || return 1
 
-    # THE TOKEN GOES IN A CONFIG FILE, NOT ON THE COMMAND LINE. `-H "Authorization:
-    # Bearer $token"` puts the credential in /proc/<pid>/cmdline, where any local
-    # process can read it for as long as curl runs -- the surface Credential
-    # Lifecycle §2.6 invariant 2 forbids BY NAME, and the one requirement 6 of
-    # this phase is written about. `--config` is read by curl and by nothing else.
+    # THE WHOLE CREDENTIAL-BEARING PART RUNS IN A SUBSHELL WITH ITS OWN EXIT
+    # TRAP, and the scoping is the point. `trap ... RETURN INT TERM` inside a
+    # function looks right and is not: RETURN is function-scoped but INT and
+    # TERM are GLOBAL, so the trap outlived the function and then referenced a
+    # `local cfgdir` that no longer existed -- under `set -u` the next run died
+    # with "cfgdir: unbound variable" before doing anything.
     #
-    # THIS WAS A REAL LEAK, NOT A HYPOTHETICAL ONE. It shipped, ran on instance
-    # zero, and was found on 2026-09-09 by the first run of
-    # test/canary_credential_surfaces.sh -- which is the entire argument for
-    # having written that test.
-    # /run, NOT /tmp, AND THE DIFFERENCE IS THE STANDARD'S POINT.
-    # Credential Lifecycle §2.6 invariant 1 requires a transient credential to
-    # sit on a "tmpfs / memory-backed file (e.g. /run); NEVER persistent disk".
-    # `mktemp -d` honours $TMPDIR and otherwise lands in /tmp -- the root
-    # filesystem. The argv leak fixed on 2026-09-09 was moved straight onto the
-    # medium the same invariant forbids, which is half a fix.
+    # A subshell EXIT trap fires on every path out -- normal return, error,
+    # SIGINT, SIGTERM -- and both the trap and the variable die with it.
     #
-    # AND THE SCRUB IS A TRAP, NOT A LINE. A single `rm` at the end runs only on
-    # the success path; `set -euo pipefail` is in force and `curl --max-time 15`
-    # is a realistic place for an operator to press Ctrl-C. The trap covers the
-    # interrupt, the error exit, and the return.
-    cfgdir="$(mktemp -d -p /run)" || return 1
-    chmod 700 "$cfgdir"
-    trap 'rm -rf "$cfgdir"' RETURN INT TERM
-    printf 'header = "Authorization: Bearer %s"\n' "$token" > "${cfgdir}/curlrc"
-    chmod 600 "${cfgdir}/curlrc"
-
-    code="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 15 \
-        --config "${cfgdir}/curlrc" \
-        -H "Accept: application/vnd.github+json" \
-        "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}" 2>/dev/null || echo "000")"
-
-    [[ "$code" == "200" ]]
+    # /run, NOT /tmp: Credential Lifecycle §2.6 invariant 1 requires a transient
+    # credential on a "tmpfs / memory-backed file (e.g. /run); NEVER persistent
+    # disk". `mktemp -d` alone lands in /tmp, which is the root filesystem --
+    # so moving the token out of argv and into /tmp was half a fix.
+    #
+    # NO `-f`: with --fail, curl exits non-zero on 4xx AFTER `-w` has already
+    # printed the status, so `|| echo "000"` appended and produced "401000".
+    # Harmless while the only test is equality with 200, and wrong for anything
+    # that reads the value.
+    code="$(
+        cfgdir="$(mktemp -d -p /run)" || exit 1
+        trap 'rm -rf "$cfgdir"' EXIT
+        chmod 700 "$cfgdir"
+        printf 'header = "Authorization: Bearer %s"\n' "$token" > "${cfgdir}/curlrc"
+        chmod 600 "${cfgdir}/curlrc"
+        curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+            --config "${cfgdir}/curlrc" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}" 2>/dev/null
+    )"
+    [[ "${code:-000}" == "200" ]]
 }
 
 # THE ONE QUESTION. Sets PAT, or exits. Order is cheapest-first: an env var
