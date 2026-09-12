@@ -718,7 +718,7 @@ EOF
             log_error "  1. Verify the public key has been added to GitHub"
             log_error "     Public key location: $DEPLOY_KEY_PUB"
             log_error "     GitHub URL: https://github.com/helloskyy-io/Skyy-Command/settings/keys"
-            log_error "  2. Verify the key has the correct permissions (read for prod, read/write for dev)"
+            log_error "  2. Verify the key was added with read access"
             log_error "  3. Verify the repository exists and is accessible"
             log_error "  4. If the key was just added, wait a few seconds and try again"
             log_error ""
