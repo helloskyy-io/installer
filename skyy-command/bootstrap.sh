@@ -1113,7 +1113,7 @@ main() {
     log_info "Follow the instructions printed by the private bootstrap above:"
     log_info "  - On a fresh VM, the bootstrap will have created config.yaml and .env"
     log_info "    from templates and exited. Edit those files, then re-run:"
-    log_info "      sudo /opt/skyy-net/skyy-command/lib/temporal/scripts/bootstrap/bootstrap.sh"
+    log_info "      sudo $MDC_REPO_DIR/lib/temporal/scripts/bootstrap/bootstrap.sh"
     log_info "  - On the second run, the bootstrap installs K3s and deploys Temporal."
     log_info "  - When Phase 2 completes, start the Genesis workflow to finish the install."
     log_info "═══════════════════════════════════════════════════════════════"
