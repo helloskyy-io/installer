@@ -504,7 +504,7 @@ install_docker() {
 #
 # Why this is here:
 #   The private bootstrap script
-#   (skyy-command/components/temporal/scripts/bootstrap/bootstrap.sh)
+#   (skyy-command/lib/temporal/scripts/bootstrap/bootstrap.sh)
 #   requires `helm` on PATH for the chart-rendering pipeline after the
 #   Phase 1c A4 refactor (skyy-command PR #29). A fresh VM without helm
 #   hits a clear error downstream, but provisioning helm proactively is
@@ -649,9 +649,8 @@ configure_deploy_key() {
         log_warn "  1. Go to: https://github.com/helloskyy-io/Skyy-Command/settings/keys"
         log_warn "  2. Click 'Add deploy key'"
         log_warn "  3. Paste the public key above"
-        log_warn "  4. For production: Give the key READ access only"
-        log_warn "  5. For development: Check 'Allow write access'"
-        log_warn "  6. Click 'Add key'"
+        log_warn "  4. Leave the key read-only (the GitHub default) — the bootstrap only clones"
+        log_warn "  5. Click 'Add key'"
         echo ""
         log_warn "Press ENTER after you have added the key to GitHub..."
         read -r
@@ -883,7 +882,7 @@ clone_repo() {
 launch_private_bootstrap() {
     log_info "Preparing to launch private bootstrap script from skyy-command..."
     
-    local private_bootstrap="$MDC_REPO_DIR/components/temporal/scripts/bootstrap/bootstrap.sh"
+    local private_bootstrap="$MDC_REPO_DIR/lib/temporal/scripts/bootstrap/bootstrap.sh"
 
     # Verify repository was cloned successfully
     if [[ ! -d "$MDC_REPO_DIR" ]]; then
@@ -910,7 +909,7 @@ launch_private_bootstrap() {
     # Verify private bootstrap script exists
     if [[ ! -f "$private_bootstrap" ]]; then
         log_error "Private bootstrap script not found at: $private_bootstrap"
-        log_error "Expected location: $MDC_REPO_DIR/components/temporal/scripts/bootstrap/bootstrap.sh"
+        log_error "Expected location: $MDC_REPO_DIR/lib/temporal/scripts/bootstrap/bootstrap.sh"
         log_error "Please verify:"
         log_error "  1. The skyy-command repository was cloned correctly"
         log_error "  2. The repository contains the expected directory structure"
@@ -1114,7 +1113,7 @@ main() {
     log_info "Follow the instructions printed by the private bootstrap above:"
     log_info "  - On a fresh VM, the bootstrap will have created config.yaml and .env"
     log_info "    from templates and exited. Edit those files, then re-run:"
-    log_info "      sudo /opt/skyy-net/skyy-command/components/temporal/scripts/bootstrap/bootstrap.sh"
+    log_info "      sudo /opt/skyy-net/skyy-command/lib/temporal/scripts/bootstrap/bootstrap.sh"
     log_info "  - On the second run, the bootstrap installs K3s and deploys Temporal."
     log_info "  - When Phase 2 completes, start the Genesis workflow to finish the install."
     log_info "═══════════════════════════════════════════════════════════════"
