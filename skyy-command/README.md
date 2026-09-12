@@ -22,7 +22,7 @@ The public installer script performs the following steps:
 6. **Configure deploy key** - Generates SSH deploy key for skyy-command repository access
    - **Manual step required**: Script displays the public key and prompts you to add it to GitHub
    - Add the deploy key to: `https://github.com/helloskyy-io/Skyy-Command/settings/keys` (Deploy keys section)
-   - **Important**: Give the key **read access** (write access not needed for bootstrap)
+   - **Important**: Give the key **read access only** (leave the write checkbox unchecked)
 7. **Clone repository** - Clones skyy-command repository using the deploy key
 8. **Launch private bootstrap** - Executes the private bootstrap script from skyy-command to complete Temporal setup
 
@@ -45,7 +45,7 @@ installer/
 Additional apps can be added as sibling folders (e.g., `installer/skyy-gate/`, etc.)
 
 The private bootstrap script is located in the `skyy-command` repository at:
-`components/temporal/scripts/bootstrap/bootstrap.sh`
+`lib/temporal/scripts/bootstrap/bootstrap.sh`
 
 ## License
 

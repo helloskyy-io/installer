@@ -504,7 +504,7 @@ install_docker() {
 #
 # Why this is here:
 #   The private bootstrap script
-#   (skyy-command/components/temporal/scripts/bootstrap/bootstrap.sh)
+#   (skyy-command/lib/temporal/scripts/bootstrap/bootstrap.sh)
 #   requires `helm` on PATH for the chart-rendering pipeline after the
 #   Phase 1c A4 refactor (skyy-command PR #29). A fresh VM without helm
 #   hits a clear error downstream, but provisioning helm proactively is
@@ -649,9 +649,8 @@ configure_deploy_key() {
         log_warn "  1. Go to: https://github.com/helloskyy-io/Skyy-Command/settings/keys"
         log_warn "  2. Click 'Add deploy key'"
         log_warn "  3. Paste the public key above"
-        log_warn "  4. For production: Give the key READ access only"
-        log_warn "  5. For development: Check 'Allow write access'"
-        log_warn "  6. Click 'Add key'"
+        log_warn "  4. Give the key READ access only (leave the write checkbox unchecked)"
+        log_warn "  5. Click 'Add key'"
         echo ""
         log_warn "Press ENTER after you have added the key to GitHub..."
         read -r
@@ -719,7 +718,7 @@ EOF
             log_error "  1. Verify the public key has been added to GitHub"
             log_error "     Public key location: $DEPLOY_KEY_PUB"
             log_error "     GitHub URL: https://github.com/helloskyy-io/Skyy-Command/settings/keys"
-            log_error "  2. Verify the key has the correct permissions (read for prod, read/write for dev)"
+            log_error "  2. Verify the key was added with read access"
             log_error "  3. Verify the repository exists and is accessible"
             log_error "  4. If the key was just added, wait a few seconds and try again"
             log_error ""
@@ -883,7 +882,7 @@ clone_repo() {
 launch_private_bootstrap() {
     log_info "Preparing to launch private bootstrap script from skyy-command..."
     
-    local private_bootstrap="$MDC_REPO_DIR/components/temporal/scripts/bootstrap/bootstrap.sh"
+    local private_bootstrap="$MDC_REPO_DIR/lib/temporal/scripts/bootstrap/bootstrap.sh"
 
     # Verify repository was cloned successfully
     if [[ ! -d "$MDC_REPO_DIR" ]]; then
@@ -910,7 +909,7 @@ launch_private_bootstrap() {
     # Verify private bootstrap script exists
     if [[ ! -f "$private_bootstrap" ]]; then
         log_error "Private bootstrap script not found at: $private_bootstrap"
-        log_error "Expected location: $MDC_REPO_DIR/components/temporal/scripts/bootstrap/bootstrap.sh"
+        log_error "Expected location: $MDC_REPO_DIR/lib/temporal/scripts/bootstrap/bootstrap.sh"
         log_error "Please verify:"
         log_error "  1. The skyy-command repository was cloned correctly"
         log_error "  2. The repository contains the expected directory structure"
@@ -1114,7 +1113,7 @@ main() {
     log_info "Follow the instructions printed by the private bootstrap above:"
     log_info "  - On a fresh VM, the bootstrap will have created config.yaml and .env"
     log_info "    from templates and exited. Edit those files, then re-run:"
-    log_info "      sudo /opt/skyy-net/skyy-command/components/temporal/scripts/bootstrap/bootstrap.sh"
+    log_info "      sudo $MDC_REPO_DIR/lib/temporal/scripts/bootstrap/bootstrap.sh"
     log_info "  - On the second run, the bootstrap installs K3s and deploys Temporal."
     log_info "  - When Phase 2 completes, start the Genesis workflow to finish the install."
     log_info "═══════════════════════════════════════════════════════════════"
