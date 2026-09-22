@@ -95,8 +95,14 @@ log_error() {
 # script — on every exit path, success and failure alike.
 PAT=""
 ASKPASS_DIR=""
+# The probe's last HTTP status and curl's own stderr — how a REFUSAL is told
+# apart from a FAILURE TO ASK. Never carries the token (it rides a config file).
+PROBE_HTTP_CODE=""
+PROBE_ERR_FILE="$(mktemp)"
 cleanup() {
+    rm -f "$PROBE_ERR_FILE"
     PAT=""
+    unset GITHUB_READ_PAT
     [[ -n "$ASKPASS_DIR" && -d "$ASKPASS_DIR" ]] && rm -rf "$ASKPASS_DIR"
     return 0
 }
@@ -534,24 +540,43 @@ pat_reads_repo() {
         chmod 700 "$cfgdir"
         printf 'header = "Authorization: Bearer %s"\n' "$token" > "${cfgdir}/curlrc"
         chmod 600 "${cfgdir}/curlrc"
+        # curl's own stderr is KEPT (into $PROBE_ERR_FILE) — `-sS` exists to show
+        # the transport error, and discarding it is what made a network fault
+        # indistinguishable from a rejected token. It cannot carry the credential:
+        # the token is in the config file, never in argv or the URL.
         curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
             --config "${cfgdir}/curlrc" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_OWNER}/${repo}" 2>/dev/null
+            "https://api.github.com/repos/${GITHUB_OWNER}/${repo}" 2>"$PROBE_ERR_FILE"
     )"
-    [[ "${code:-000}" == "200" ]]
+    PROBE_HTTP_CODE="${code:-000}"
+    case "$PROBE_HTTP_CODE" in
+        200) return 0 ;;          # granted
+        401|403|404) return 1 ;;  # GitHub ANSWERED and refused / does not show it
+        *)   return 2 ;;          # 000 (no response), 5xx, anything else: transport
+    esac
 }
 
 # The token must reach BOTH repositories this script clones — that is the
 # READ token's scope per the runbook, and a token that covers one and not the
 # other fails here, naming the one it misses, rather than at the second clone.
+# A REFUSAL and a FAILURE TO ASK are different answers, and telling an operator
+# to re-mint a perfectly good token because the VM's network blipped is the worse
+# of the two mistakes. Returns 0 (both reachable), 1 (GitHub refused — the token
+# is wrong), or 2 (the question could not be put — transport).
 pat_is_usable() {
-    local token="$1" repo
+    local token="$1" repo rc
     for repo in "$SKYY_COMMAND_REPO_NAME" "$COLLECTIONS_REPO_NAME"; do
-        if ! pat_reads_repo "$token" "$repo"; then
-            log_warn "The token cannot read ${GITHUB_OWNER}/${repo}"
-            return 1
+        pat_reads_repo "$token" "$repo" && continue
+        rc=$?
+        if [[ $rc -eq 2 ]]; then
+            log_error "Could not reach api.github.com to check the token (HTTP ${PROBE_HTTP_CODE})."
+            [[ -s "$PROBE_ERR_FILE" ]] && log_error "  curl: $(tr -d '\r' < "$PROBE_ERR_FILE" | tail -1)"
+            log_error "  This is a NETWORK or API-availability failure, not a verdict on the token."
+            return 2
         fi
+        log_warn "GitHub refused the token for ${GITHUB_OWNER}/${repo} (HTTP ${PROBE_HTTP_CODE})"
+        return 1
     done
     return 0
 }
@@ -562,12 +587,9 @@ pat_is_usable() {
 resolve_pat() {
     if [[ -n "${GITHUB_READ_PAT:-}" ]]; then
         log_info "Token supplied in the environment; validating..."
-        if pat_is_usable "$GITHUB_READ_PAT"; then
-            PAT="$GITHUB_READ_PAT"
-            log_info "Token valid for ${SKYY_COMMAND_REPO_NAME} and ${COLLECTIONS_REPO_NAME}"
-            return 0
-        fi
-        log_error "GITHUB_READ_PAT is set but cannot read the repositories above."
+        pat_is_usable "$GITHUB_READ_PAT" && { PAT="$GITHUB_READ_PAT"; log_info "Token valid for ${SKYY_COMMAND_REPO_NAME} and ${COLLECTIONS_REPO_NAME}"; return 0; }
+        [[ $? -eq 2 ]] && { log_error "Fix the network (or wait for the API) and re-run; the token was never judged."; exit 1; }
+        log_error "GITHUB_READ_PAT is set but GitHub refused it for the repositories above."
         log_error "  Expired, revoked, awaiting org approval, or missing Contents:Read on one of them."
         exit 1
     fi
@@ -576,12 +598,9 @@ resolve_pat() {
     existing="$(read_pat_from_cluster)"
     if [[ -n "$existing" ]]; then
         log_info "Found the READ token in the k3s Secret ${PAT_SECRET_NS}/${PAT_SECRET_NAME}; validating..."
-        if pat_is_usable "$existing"; then
-            PAT="$existing"
-            log_info "Stored token is valid — not asking you for one"
-            return 0
-        fi
-        log_warn "The stored token is present but NO LONGER VALID for these repositories."
+        pat_is_usable "$existing" && { PAT="$existing"; log_info "Stored token is valid — not asking you for one"; return 0; }
+        [[ $? -eq 2 ]] && { log_error "Fix the network (or wait for the API) and re-run; the stored token was never judged."; exit 1; }
+        log_warn "The stored token is present but GitHub REFUSED it for these repositories."
         log_warn "  Fine-grained tokens expire after at most 366 days; this is the usual cause."
         log_warn "  A new one is needed — mint and re-place it per guide/github_credentials.md."
     fi
@@ -611,11 +630,12 @@ resolve_pat() {
         log_error "No token entered."
         exit 1
     fi
-    if ! pat_is_usable "$PAT"; then
-        log_error "That token cannot read both repositories."
+    pat_is_usable "$PAT" || {
+        [[ $? -eq 2 ]] && { log_error "The token you pasted was never judged — fix the network and re-run."; exit 1; }
+        log_error "GitHub refused that token for one of the two repositories."
         log_error "  Check: org approval, Contents:Read, and that BOTH repositories are selected."
         exit 1
-    fi
+    }
     log_info "Token valid for ${SKYY_COMMAND_REPO_NAME} and ${COLLECTIONS_REPO_NAME}"
 }
 
@@ -623,7 +643,16 @@ resolve_pat() {
 # is never in the file — only a reference to the environment.
 make_askpass() {
     [[ -n "$ASKPASS_DIR" ]] && return 0
-    ASKPASS_DIR="$(mktemp -d -p /run)"; chmod 700 "$ASKPASS_DIR"
+    # CHECKED, because the only caller reaches this from inside an `if !` where
+    # `set -e` is suppressed: an unchecked failure leaves ASKPASS_DIR empty, the
+    # helper is written to `/askpass.sh` at the filesystem root, and cleanup's
+    # `[[ -n "$ASKPASS_DIR" ]]` guard cannot remove what it cannot name.
+    ASKPASS_DIR="$(mktemp -d -p /run)" || {
+        log_error "Could not create a memory-backed directory under /run for the git credential helper."
+        log_error "  /run is full or not writable; the token must not fall back to disk."
+        exit 1
+    }
+    chmod 700 "$ASKPASS_DIR"
     cat > "${ASKPASS_DIR}/askpass.sh" <<'ASKPASS'
 #!/usr/bin/env bash
 case "$1" in
@@ -687,12 +716,18 @@ ensure_repo_cloned() {
     if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
         log_info "Repository present at $dir (idempotent: skipping clone/pull)"
 
+        # ASSERT BEFORE LOGGING. A stored remote is the one string here that can
+        # carry a credential now that the platform reaches GitHub over HTTPS
+        # (on the SSH model it never could), and this function's own contract is
+        # that no token reaches a log. So the credential-free check runs first,
+        # and the old URL is never printed either way — a changed remote is
+        # reported as the fact it is.
+        assert_remote_is_clean "$dir"
+
         local current_remote
         current_remote="$(git -C "$dir" remote get-url origin 2>/dev/null || echo "")"
         if [[ "$current_remote" != "$clean_url" ]]; then
-            log_info "Moving origin to the clean HTTPS URL"
-            log_info "  Current: $current_remote"
-            log_info "  New:     $clean_url"
+            log_info "Moving origin to the clean HTTPS URL: $clean_url"
             git -C "$dir" remote set-url origin "$clean_url" || {
                 log_error "Failed to set origin on $dir"
                 return 1
@@ -700,7 +735,6 @@ ensure_repo_cloned() {
         else
             log_info "Origin already correct: $clean_url"
         fi
-        assert_remote_is_clean "$dir"
 
         local repo_owner
         repo_owner="$(stat -c "%U:%G" "$dir" 2>/dev/null)"
@@ -955,8 +989,12 @@ main() {
     echo ""
 
     # The token has done its only job. It is not the private bootstrap's to
-    # inherit here — nothing downstream in this run reads it.
+    # inherit here — nothing downstream in this run reads it. BOTH carriers are
+    # cleared: the shell variable, and the EXPORTED environment variable an
+    # unattended `sudo -E` run was started with — `launch_private_bootstrap`
+    # runs `bash`, and a child inherits the environment, not the shell locals.
     PAT=""
+    unset GITHUB_READ_PAT
 
     log_info "[Task 6/6] Launching private bootstrap script..."
     if launch_private_bootstrap; then

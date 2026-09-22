@@ -22,7 +22,7 @@ The public installer script performs the following steps:
 4. **Install Helm** - Installs helm (required by the private bootstrap's chart-rendering pipeline)
 5. **Install Git** - Ensures Git is available and configures git identity
 6. **Clone the repositories** - Clones `skyy-command` and, beside it, `mdc-ansible-collections` (the private bootstrap's worker-image bake reads the collections from that clone) over HTTPS with the READ token supplied through `GIT_ASKPASS`. The token is never in a remote URL or `.git/config` — the stored remote is asserted credential-free after every clone. An existing checkout is left as it is, with its origin moved to the clean HTTPS URL
-7. **Launch private bootstrap** - Clears the token, then executes the private bootstrap script from skyy-command to complete Temporal setup
+7. **Launch private bootstrap** - Clears BOTH carriers of the token — the shell variable and the exported `GITHUB_READ_PAT` an unattended `sudo -E` run was started with, since the private bootstrap runs as a child and inherits the environment — then executes it to complete Temporal setup
 
 ## Requirements
 
