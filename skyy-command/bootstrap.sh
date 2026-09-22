@@ -96,16 +96,16 @@ log_error() {
 # expansion — including the token in `pat_reads_repo`'s argv, in `local token=`,
 # and in the GIT_ASKPASS assignment. The header's "never echoed" and the phase's
 # "no token in argv, a remote URL, .git/config, or a log" both cover this.
-# Every function that HOLDS the value brackets itself with these two: xtrace off
-# on entry, restored to whatever it was on exit. Control flow still traces; the
-# credential does not.
-_hide_xtrace() {
-    case $- in *x*) _XTRACE_WAS_ON=1; set +x ;; *) _XTRACE_WAS_ON=0 ;; esac
-}
-_restore_xtrace() {
-    [[ "${_XTRACE_WAS_ON:-0}" -eq 1 ]] && set -x
-    return 0
-}
+# Every function that HOLDS the value opens with `local -; set +x`. Bash
+# restores the options `local -` saved when the FUNCTION RETURNS, on every path: normal, early, error, and correctly through nesting.
+# A hand-rolled save/restore pair does none of those: one global flag is
+# overwritten by the first nested call (so the outer restore becomes a no-op and
+# the trace is lost for the rest of the run), and every early `return` skips the
+# restore entirely. Measured on this script at pass 2.
+#
+# It is INLINE at each site rather than a shared helper on purpose: `local -` is
+# scoped to the function that runs it, so a helper would restore the options on
+# its OWN return — one frame too early, which is the bug this replaces.
 
 # The token, and the askpass helper that hands it to git. Both die with the
 # script — on every exit path, success and failure alike.
@@ -525,13 +525,12 @@ a_clone_is_needed() {
 # no k3s, no namespace, no Secret, no key. Every one of those means "we do not
 # have a token", which is the only thing the caller needs to know.
 read_pat_from_cluster() {
-    _hide_xtrace
-    command -v kubectl >/dev/null 2>&1 || { _restore_xtrace; return 0; }
-    [[ -r /etc/rancher/k3s/k3s.yaml ]] || { _restore_xtrace; return 0; }
+    local -; set +x    # the token is in scope below; xtrace is a log
+    command -v kubectl >/dev/null 2>&1 || return 0
+    [[ -r /etc/rancher/k3s/k3s.yaml ]] || return 0
     KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n "$PAT_SECRET_NS" \
         get secret "$PAT_SECRET_NAME" -o "jsonpath={.data.${PAT_SECRET_KEY}}" 2>/dev/null \
         | base64 -d 2>/dev/null || true
-    _restore_xtrace
 }
 
 # Asks GitHub whether this token reaches one repository: 200 means yes, and a
@@ -539,9 +538,9 @@ read_pat_from_cluster() {
 # invisible to what it was not granted. Anything but 200 — expired, revoked,
 # awaiting org approval, wrong scope — means we need a new one.
 pat_reads_repo() {
-    _hide_xtrace
+    local -; set +x    # the token is in scope below; xtrace is a log
     local token="$1" repo="$2" code
-    [[ -n "$token" ]] || { _restore_xtrace; return 1; }
+    [[ -n "$token" ]] || return 1
 
     # THE WHOLE CREDENTIAL-BEARING PART RUNS IN A SUBSHELL WITH ITS OWN EXIT
     # TRAP, and the scoping is the point: the trap and the directory die with
@@ -573,7 +572,6 @@ pat_reads_repo() {
     )"
     local probe_rc=$?
     PROBE_HTTP_CODE="${code:-000}"
-    _restore_xtrace
     if [[ $probe_rc -eq 3 ]]; then
         PROBE_HTTP_CODE="local"
         return 3
@@ -591,9 +589,13 @@ pat_reads_repo() {
 # A REFUSAL and a FAILURE TO ASK are different answers, and telling an operator
 # to re-mint a perfectly good token because the VM's network blipped is the worse
 # of the two mistakes. Returns 0 (both reachable), 1 (GitHub refused — the token
-# is wrong), or 2 (the question could not be put — transport).
+# is wrong), 2 (transport — the question could not be put to GitHub), or 3 (a
+# LOCAL fault — no writable /run, so the token could not be held to ask at all).
+# 2 and 3 are both "never judged" and have DIFFERENT remedies, so they stay
+# distinct all the way up: collapsing them here is what sent an operator to debug
+# the network on a host whose tmpfs was the problem.
 pat_is_usable() {
-    _hide_xtrace
+    local -; set +x    # the token is in scope below; xtrace is a log
     local token="$1" repo rc
     for repo in "$SKYY_COMMAND_REPO_NAME" "$COLLECTIONS_REPO_NAME"; do
         pat_reads_repo "$token" "$repo" && continue
@@ -602,8 +604,7 @@ pat_is_usable() {
             log_error "Could not create a memory-backed directory under /run to hold the token while checking it."
             log_error "  /run is full or not writable on this host — a LOCAL fault, not the network and not the token."
             log_error "  The token must not fall back to disk, so the check cannot be made."
-            _restore_xtrace
-            return 2
+            return 3
         fi
         if [[ $rc -eq 2 ]]; then
             log_error "Could not reach api.github.com to check the token (HTTP ${PROBE_HTTP_CODE})."
@@ -612,10 +613,8 @@ pat_is_usable() {
             return 2
         fi
         log_warn "GitHub refused the token for ${GITHUB_OWNER}/${repo} (HTTP ${PROBE_HTTP_CODE})"
-        _restore_xtrace
         return 1
     done
-    _restore_xtrace
     return 0
 }
 
@@ -623,11 +622,14 @@ pat_is_usable() {
 # check, the cluster costs a kubectl call, and only if both come up empty is a
 # human interrupted.
 resolve_pat() {
-    _hide_xtrace
+    local -; set +x    # the token is in scope below; xtrace is a log
+    local rc
     if [[ -n "${GITHUB_READ_PAT:-}" ]]; then
         log_info "Token supplied in the environment; validating..."
         pat_is_usable "$GITHUB_READ_PAT" && { PAT="$GITHUB_READ_PAT"; log_info "Token valid for ${SKYY_COMMAND_REPO_NAME} and ${COLLECTIONS_REPO_NAME}"; return 0; }
-        [[ $? -eq 2 ]] && { log_error "Fix the network (or wait for the API) and re-run; the token was never judged."; exit 1; }
+        rc=$?
+        [[ $rc -eq 3 ]] && { log_error "Fix /run on this host and re-run; the token was never judged."; exit 1; }
+        [[ $rc -eq 2 ]] && { log_error "Fix the network (or wait for the API) and re-run; the token was never judged."; exit 1; }
         log_error "GITHUB_READ_PAT is set but GitHub refused it for the repositories above."
         log_error "  Expired, revoked, awaiting org approval, or missing Contents:Read on one of them."
         exit 1
@@ -638,7 +640,9 @@ resolve_pat() {
     if [[ -n "$existing" ]]; then
         log_info "Found the READ token in the k3s Secret ${PAT_SECRET_NS}/${PAT_SECRET_NAME}; validating..."
         pat_is_usable "$existing" && { PAT="$existing"; log_info "Stored token is valid — not asking you for one"; return 0; }
-        [[ $? -eq 2 ]] && { log_error "Fix the network (or wait for the API) and re-run; the stored token was never judged."; exit 1; }
+        rc=$?
+        [[ $rc -eq 3 ]] && { log_error "Fix /run on this host and re-run; the stored token was never judged."; exit 1; }
+        [[ $rc -eq 2 ]] && { log_error "Fix the network (or wait for the API) and re-run; the stored token was never judged."; exit 1; }
         log_warn "The stored token is present but GitHub REFUSED it for these repositories."
         log_warn "  Fine-grained tokens expire after at most 366 days; this is the usual cause."
         log_warn "  A new one is needed — mint and re-place it per guide/github_credentials.md."
@@ -670,13 +674,14 @@ resolve_pat() {
         exit 1
     fi
     pat_is_usable "$PAT" || {
-        [[ $? -eq 2 ]] && { log_error "The token you pasted was never judged — fix the network and re-run."; exit 1; }
+        rc=$?
+        [[ $rc -eq 3 ]] && { log_error "The token you pasted was never judged — fix /run on this host and re-run."; exit 1; }
+        [[ $rc -eq 2 ]] && { log_error "The token you pasted was never judged — fix the network and re-run."; exit 1; }
         log_error "GitHub refused that token for one of the two repositories."
         log_error "  Check: org approval, Contents:Read, and that BOTH repositories are selected."
         exit 1
     }
     log_info "Token valid for ${SKYY_COMMAND_REPO_NAME} and ${COLLECTIONS_REPO_NAME}"
-    _restore_xtrace
 }
 
 # The askpass helper, created once so every clone can use it. The token's VALUE
@@ -713,11 +718,10 @@ ASKPASS
 # the installer runs before any of that code is on the box.
 git_with_token() {
     make_askpass
-    _hide_xtrace
+    local -; set +x    # the token is in scope below; xtrace is a log
     local rc=0
     GITHUB_READ_PAT_INTERNAL="$PAT" GIT_ASKPASS="${ASKPASS_DIR}/askpass.sh" \
         GIT_TERMINAL_PROMPT=0 git -c credential.helper= "$@" || rc=$?
-    _restore_xtrace
     return $rc
 }
 

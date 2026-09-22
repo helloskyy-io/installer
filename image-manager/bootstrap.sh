@@ -62,6 +62,13 @@
 #   written to a file, never in a remote URL, never in `.git/config`, never on a
 #   command line where `ps` can read it, and never echoed.
 #
+#   AND NEVER TRACED. `set -x` prints every expansion, so an operator debugging
+#   a failed install with `curl … | sudo bash -x` would print the token six
+#   times over (measured). Every function that HOLDS the value opens with
+#   `local -; set +x`: bash restores the options `local -` saved when that
+#   function returns, on every path — normal, early, error, and through
+#   nesting. Control flow still traces; the credential does not.
+#
 # USAGE
 #   curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/image-manager/bootstrap.sh | sudo bash
 #
@@ -118,6 +125,7 @@ check_root() {
 # no k3s, no namespace, no Secret, no key. Every one of those means "we do not
 # have a token", which is the only thing the caller needs to know.
 read_pat_from_cluster() {
+    local -; set +x    # the token is in scope below; xtrace is a log
     command -v kubectl >/dev/null 2>&1 || return 0
     [[ -r /etc/rancher/k3s/k3s.yaml ]] || return 0
     KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n "$PAT_SECRET_NS" \
@@ -130,6 +138,7 @@ read_pat_from_cluster() {
 # wrong scope — means we need a new one, and the operator finds out here rather
 # than three steps later.
 pat_is_usable() {
+    local -; set +x    # the token is in scope below; xtrace is a log
     local token="$1" code
     [[ -n "$token" ]] || return 1
 
@@ -170,6 +179,7 @@ pat_is_usable() {
 # costs nothing to check, the cluster costs a kubectl call, and only if both
 # come up empty is a human interrupted.
 resolve_pat() {
+    local -; set +x    # the token is in scope below; xtrace is a log
     if [[ -n "${IMAGE_MANAGER_PAT:-}" ]]; then
         log_info "Token supplied in the environment; validating..."
         if pat_is_usable "$IMAGE_MANAGER_PAT"; then
@@ -304,6 +314,7 @@ ASKPASS
 #   .git/config -> follows from the above, and is ASSERTED below
 #   cred store  -> `-c credential.helper=` neutralises any inherited helper
 git_with_token() {
+    local -; set +x    # the token is in scope below; xtrace is a log
     make_askpass
     IMAGE_MANAGER_PAT_INTERNAL="$PAT" GIT_ASKPASS="${ASKPASS_DIR}/askpass.sh" \
         GIT_TERMINAL_PROMPT=0 git -c credential.helper= "$@"
