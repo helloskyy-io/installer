@@ -144,8 +144,10 @@ Fine-grained tokens are disabled for the organisation. **Do not fall back to a c
 classic token reaches every repository your *account* can see, across every organisation, at full
 read-write-delete. That is the worst credential to place on an internet-facing box.
 
-Say so instead: there is a deploy-key variant of this installer that trades the manual paste step
-for needing no organisation policy at all.
+Say so instead: ask the organisation owner to enable fine-grained tokens for the repositories this
+installer reads. There is no deploy-key variant — per-repository deploy keys are retired across the
+platform (SSH Key Management Standard §3), so a token is the only path, and the narrow one is the
+right one to ask for.
 
 ---
 
