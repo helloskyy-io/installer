@@ -192,14 +192,16 @@ setup_folder_and_group() {
     local needs_dir_perms=false
     
     # Check ownership on base directory
-    local current_owner=$(stat -c "%U:%G" "$BASE_DIR" 2>/dev/null)
+    local current_owner
+    current_owner=$(stat -c "%U:%G" "$BASE_DIR" 2>/dev/null)
     if [[ "$current_owner" != "root:$GROUP_NAME" ]]; then
         needs_ownership=true
         log_info "Ownership needs update: current=$current_owner, expected=root:$GROUP_NAME"
     fi
     
     # Check directory permissions on base directory
-    local base_dir_perms=$(stat -c "%a" "$BASE_DIR" 2>/dev/null)
+    local base_dir_perms
+    base_dir_perms=$(stat -c "%a" "$BASE_DIR" 2>/dev/null)
     if [[ "$base_dir_perms" != "2775" ]]; then
         needs_dir_perms=true
         log_info "Base directory permissions need update: current=$base_dir_perms, expected=2775"
@@ -312,7 +314,9 @@ install_docker() {
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         chmod a+r /etc/apt/keyrings/docker.gpg
         
-        # Detect Ubuntu version and set up repository
+        # Detect Ubuntu version and set up repository. The file is the host's,
+        # not this repo's, so shellcheck cannot follow it at lint time.
+        # shellcheck source=/dev/null
         . /etc/os-release
         echo \
           "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
@@ -468,7 +472,8 @@ install_git() {
     log_info "Configuring git identity for root user..."
     
     # Check if git user.name is already configured
-    local current_name=$(git config --global user.name 2>/dev/null || echo "")
+    local current_name
+    current_name=$(git config --global user.name 2>/dev/null || echo "")
     if [[ "$current_name" == "$GIT_USER_NAME" ]]; then
         log_info "Git user.name already configured: $GIT_USER_NAME"
     else
@@ -480,7 +485,8 @@ install_git() {
     fi
     
     # Check if git user.email is already configured
-    local current_email=$(git config --global user.email 2>/dev/null || echo "")
+    local current_email
+    current_email=$(git config --global user.email 2>/dev/null || echo "")
     if [[ "$current_email" == "$GIT_USER_EMAIL" ]]; then
         log_info "Git user.email already configured: $GIT_USER_EMAIL"
     else
