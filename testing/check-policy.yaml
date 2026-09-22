@@ -1,0 +1,31 @@
+# Which of this repo's CI checks gate a merge, and which do not.
+#
+# Required by the Testing Standard § "The declaration is machine-readable, not
+# prose". Consumed by the dispatch pipeline's merge gate (merge-pr.py), which
+# refuses a merge verdict while a blocking check is red — and refuses with
+# `no_policy` when this file is absent. That refusal is what this file was
+# written in response to: PR #6 rewrote 908 lines of the skyy-command bootstrap
+# to clone over HTTPS with a placed token, passed six review passes, and could
+# not be merged by the helper because this repo declared no gate at all.
+#
+# It is NOT read by GitHub — required status checks are a paid feature on
+# private repos and are deliberately not pursued across this fleet. Per the
+# Testing Standard, a dispatch pipeline that reads this file and refuses to
+# emit a merge verdict on red IS a gate in full; the mechanism differs, the
+# control does not.
+#
+# NAMES ARE THE REPORTED CHECK NAME, VERBATIM — the JOB id as `gh pr checks`
+# prints it, not the workflow name or the filename.
+#
+# `blocking` means: IF IT APPEARS AND IS NOT GREEN, STOP. `tests` is
+# unfiltered (no paths:, no if:), so it appears on every PR and a verdict
+# always exists.
+
+blocking:
+  - tests                 # .github/workflows/tests.yml — testing/run-all.sh:
+                          # bash -n + shellcheck over every shell file in the tree
+
+# No advisory checks. Nothing runs on PRs here that reports tooling health
+# rather than a finding about the installer. An entry added later MUST name
+# what is consequently not covered.
+advisory: []

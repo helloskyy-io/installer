@@ -1,0 +1,50 @@
+name: Tests
+
+# The merge-path gate for this repo: testing/run-all.sh — bash -n and
+# shellcheck over every shell file in the tree — on every pull request.
+#
+# Before this file existed this repo had NO gate: the scripts that run as root
+# on a fresh VM and place an owner-issued GitHub token were verified only when
+# a human remembered to, and the dispatch pipeline's merge gate answered
+# `no_policy` to every PR (Testing Standard § "A control that no gate runs is
+# not a control"). The job id below is what testing/check-policy.yaml names as
+# blocking.
+#
+# Unfiltered on purpose: the runner discovers the whole tree (Testing Standard
+# § "A gate's trigger MUST NOT be narrower than its runner's discovery"), and
+# an unfiltered job is what guarantees a verdict exists on every PR.
+#
+# Pull request only, one run per branch (Testing Standard § "A gate runs on the
+# pull request, and nowhere else"): a push run would repeat the verdict the PR
+# already carries, and this repo's maintainers land work through PRs.
+on:
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    # Derived from visibility, never typed per repo (Testing Standard § "A gate
+    # runs on the pull request"): a private repo uses the org's own runner and
+    # spends no metered minute; a public one stays on GitHub's image, because a
+    # fork's PR runs the fork's code and must never reach a self-hosted machine.
+    # This repo is public today — the expression keeps that correct if it changes.
+    runs-on: ${{ github.event.repository.private && 'self-hosted' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the distro package rather than a marketplace action: the
+      # action would be a third party in the credential-handling repo's gate.
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck --version
+
+      - name: Run the suite
+        run: ./testing/run-all.sh

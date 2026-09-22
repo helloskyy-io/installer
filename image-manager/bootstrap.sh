@@ -62,6 +62,13 @@
 #   written to a file, never in a remote URL, never in `.git/config`, never on a
 #   command line where `ps` can read it, and never echoed.
 #
+#   AND NEVER TRACED. `set -x` prints every expansion, so an operator debugging
+#   a failed install with `curl … | sudo bash -x` would print the token six
+#   times over (measured). Every function that HOLDS the value opens with
+#   `local -; set +x`: bash restores the options `local -` saved when that
+#   function returns, on every path — normal, early, error, and through
+#   nesting. Control flow still traces; the credential does not.
+#
 # USAGE
 #   curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/image-manager/bootstrap.sh | sudo bash
 #
@@ -96,6 +103,9 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 PAT=""
 ASKPASS_DIR=""
+# The probe's last HTTP status — how a REFUSAL is told from a FAILURE TO ASK.
+# Never carries the token (it rides a curl config file on tmpfs).
+PROBE_HTTP_CODE=""
 cleanup() {
     PAT=""
     [[ -n "$ASKPASS_DIR" && -d "$ASKPASS_DIR" ]] && rm -rf "$ASKPASS_DIR"
@@ -118,6 +128,7 @@ check_root() {
 # no k3s, no namespace, no Secret, no key. Every one of those means "we do not
 # have a token", which is the only thing the caller needs to know.
 read_pat_from_cluster() {
+    local -; set +x    # the token is in scope below; xtrace is a log
     command -v kubectl >/dev/null 2>&1 || return 0
     [[ -r /etc/rancher/k3s/k3s.yaml ]] || return 0
     KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n "$PAT_SECRET_NS" \
@@ -129,7 +140,12 @@ read_pat_from_cluster() {
 # repository. 200 means yes. Anything else — expired, revoked, unapproved,
 # wrong scope — means we need a new one, and the operator finds out here rather
 # than three steps later.
+# A REFUSAL and a FAILURE TO ASK are different answers, and telling an operator
+# to re-mint a working credential because the VM's network is down is the worse
+# of the two mistakes. 0 = reachable, 1 = GitHub refused, 2 = transport (never
+# asked), 3 = a LOCAL fault (no writable /run, so the token could not be held).
 pat_is_usable() {
+    local -; set +x    # the token is in scope below; xtrace is a log
     local token="$1" code
     [[ -n "$token" ]] || return 1
 
@@ -152,8 +168,12 @@ pat_is_usable() {
     # printed the status, so `|| echo "000"` appended and produced "401000".
     # Harmless while the only test is equality with 200, and wrong for anything
     # that reads the value.
+    # A LOCAL failure here (no writable /run) is not a verdict on the network and
+    # not a verdict on the token: exit 3, distinct from every curl outcome, so the
+    # caller can name which thing is broken rather than sending an operator to
+    # debug a network that is fine.
     code="$(
-        cfgdir="$(mktemp -d -p /run)" || exit 1
+        cfgdir="$(mktemp -d -p /run)" || exit 3
         trap 'rm -rf "$cfgdir"' EXIT
         chmod 700 "$cfgdir"
         printf 'header = "Authorization: Bearer %s"\n' "$token" > "${cfgdir}/curlrc"
@@ -163,20 +183,32 @@ pat_is_usable() {
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}" 2>/dev/null
     )"
-    [[ "${code:-000}" == "200" ]]
+    local probe_rc=$?
+    if [[ $probe_rc -eq 3 ]]; then
+        log_error "Could not create a memory-backed directory under /run to hold the token while checking it."
+        log_error "  /run is full or not writable on this host — a LOCAL fault, not the network and not the token."
+        log_error "  The token must not fall back to disk, so the check cannot be made."
+        return 3
+    fi
+    case "${code:-000}" in
+        200) return 0 ;;          # granted
+        401|403|404) return 1 ;;  # GitHub ANSWERED and refused / does not show it
+        *)   PROBE_HTTP_CODE="${code:-000}"; return 2 ;;  # 000, 5xx: the question could not be put
+    esac
 }
 
 # THE ONE QUESTION. Sets PAT, or exits. Order is cheapest-first: an env var
 # costs nothing to check, the cluster costs a kubectl call, and only if both
 # come up empty is a human interrupted.
 resolve_pat() {
+    local -; set +x    # the token is in scope below; xtrace is a log
+    local rc
     if [[ -n "${IMAGE_MANAGER_PAT:-}" ]]; then
         log_info "Token supplied in the environment; validating..."
-        if pat_is_usable "$IMAGE_MANAGER_PAT"; then
-            PAT="$IMAGE_MANAGER_PAT"
-            log_info "Token valid for ${REPO_OWNER}/${REPO_NAME}"
-            return 0
-        fi
+        pat_is_usable "$IMAGE_MANAGER_PAT" && { PAT="$IMAGE_MANAGER_PAT"; log_info "Token valid for ${REPO_OWNER}/${REPO_NAME}"; return 0; }
+        rc=$?
+        [[ $rc -eq 3 ]] && { log_error "Fix /run on this host and re-run; the token was never judged."; exit 1; }
+        [[ $rc -eq 2 ]] && { log_error "Could not reach api.github.com (HTTP ${PROBE_HTTP_CODE:-000}) — a NETWORK or API-availability failure, not a verdict on the token."; log_error "  Fix the network (or wait for the API) and re-run."; exit 1; }
         log_error "IMAGE_MANAGER_PAT is set but cannot read ${REPO_OWNER}/${REPO_NAME}."
         log_error "  Expired, revoked, awaiting org approval, or missing Contents:Read."
         exit 1
@@ -186,11 +218,10 @@ resolve_pat() {
     existing="$(read_pat_from_cluster)"
     if [[ -n "$existing" ]]; then
         log_info "Found a token in the k3s Secret; validating..."
-        if pat_is_usable "$existing"; then
-            PAT="$existing"
-            log_info "Stored token is valid — not asking you for one"
-            return 0
-        fi
+        pat_is_usable "$existing" && { PAT="$existing"; log_info "Stored token is valid — not asking you for one"; return 0; }
+        rc=$?
+        [[ $rc -eq 3 ]] && { log_error "Fix /run on this host and re-run; the stored token was never judged."; exit 1; }
+        [[ $rc -eq 2 ]] && { log_error "Could not reach api.github.com (HTTP ${PROBE_HTTP_CODE:-000}) to check the stored token — a NETWORK failure, not a verdict on it."; log_error "  Fix the network (or wait for the API) and re-run."; exit 1; }
         log_warn "The stored token is present but NO LONGER VALID."
         log_warn "  Fine-grained tokens expire after at most 366 days; this is the usual cause."
         log_warn "  A new one is needed. Stage 2 will replace the stored copy."
@@ -220,11 +251,14 @@ resolve_pat() {
         log_error "No token entered."
         exit 1
     fi
-    if ! pat_is_usable "$PAT"; then
+    pat_is_usable "$PAT" || {
+        rc=$?
+        [[ $rc -eq 3 ]] && { log_error "The token you pasted was never judged — fix /run on this host and re-run."; exit 1; }
+        [[ $rc -eq 2 ]] && { log_error "The token you pasted was never judged — could not reach api.github.com (HTTP ${PROBE_HTTP_CODE:-000}). Fix the network and re-run."; exit 1; }
         log_error "That token cannot read ${REPO_OWNER}/${REPO_NAME}."
         log_error "  Check: org approval, Contents:Read, and that the repo is selected."
         exit 1
-    fi
+    }
     log_info "Token valid for ${REPO_OWNER}/${REPO_NAME}"
 }
 
@@ -304,6 +338,7 @@ ASKPASS
 #   .git/config -> follows from the above, and is ASSERTED below
 #   cred store  -> `-c credential.helper=` neutralises any inherited helper
 git_with_token() {
+    local -; set +x    # the token is in scope below; xtrace is a log
     make_askpass
     IMAGE_MANAGER_PAT_INTERNAL="$PAT" GIT_ASKPASS="${ASKPASS_DIR}/askpass.sh" \
         GIT_TERMINAL_PROMPT=0 git -c credential.helper= "$@"
@@ -400,6 +435,11 @@ assert_remote_is_clean() {
 # Stage 2 is what writes the durable copy into a k3s Secret, once a cluster
 # encrypted at rest exists to hold it.
 hand_off_to_stage_2() {
+    # The env-assignment prefix below is traced WITH its value, so this function
+    # holds the token too — the guard belongs here as much as in the four that
+    # read it. (The restore never runs because `exec` replaces the process; that
+    # is correct, and it is why the guard must be the LAST thing standing.)
+    local -; set +x
     local next="${REPO_DIR}/bootstrap.sh"
     if [[ ! -f "$next" ]]; then
         log_error "Stage 2 not found at $next"

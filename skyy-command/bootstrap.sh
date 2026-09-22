@@ -9,7 +9,23 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/skyy-command/bootstrap.sh | sudo bash
 #
-# Target state: "skyy-command repo is cloned and private bootstrap script is ready to run"
+#   It prompts for the MDC's READ token if it needs one — a GitHub fine-grained
+#   PAT, read-only, covering the repositories it clones; the mint is the runbook's
+#   (mdc-master-planning/guide/github_credentials.md). Nothing is typed on the
+#   command line, so nothing lands in shell history. For an unattended re-run,
+#   GITHUB_READ_PAT in the environment short-circuits the PROMPT — never the
+#   check — and needs `sudo -E`.
+#
+# Target state: "skyy-command and mdc-ansible-collections are cloned and the
+# private bootstrap script is ready to run"
+#
+# THE TOKEN NEVER COMES TO REST. Read from the environment or the terminal, held
+# in a shell variable, handed to git through GIT_ASKPASS and to curl through a
+# config file on tmpfs that dies with its subshell. Never in a remote URL, never
+# in .git/config, never on a command line, never echoed. It is needed for the
+# clones and for nothing after them, so it is cleared before the private
+# bootstrap is launched. Carrying it across to the cluster is the private
+# bootstrap's, once a cluster exists to hold it (The Token at the Floor).
 
 set -euo pipefail
 
@@ -21,8 +37,14 @@ BASE_DIR="${BASE_DIR:-/opt/skyy-net}"
 # Skyy-Command repository directory - where the skyy-command repo will be cloned
 MDC_REPO_DIR="${MDC_REPO_DIR:-$BASE_DIR/skyy-command}"
 
-# GitHub repository URL for Skyy-Command repo
-GITHUB_REPO="${GITHUB_REPO:-git@github.com:helloskyy-io/Skyy-Command.git}"
+# The GitHub account the platform is distributed from, and the two repositories
+# this installer clones from it: skyy-command, and mdc-ansible-collections
+# beside it — the private bootstrap's worker-image bake reads the collections
+# from that clone and refuses to start without it.
+GITHUB_OWNER="${GITHUB_OWNER:-helloskyy-io}"
+SKYY_COMMAND_REPO_NAME="${SKYY_COMMAND_REPO_NAME:-Skyy-Command}"
+COLLECTIONS_REPO_NAME="${COLLECTIONS_REPO_NAME:-mdc-ansible-collections}"
+COLLECTIONS_REPO_DIR="${COLLECTIONS_REPO_DIR:-$BASE_DIR/mdc-ansible-collections}"
 
 # User group name for collaborative development access
 GROUP_NAME="${GROUP_NAME:-skyy-net}"
@@ -39,21 +61,13 @@ GROUP_NAME="${GROUP_NAME:-skyy-net}"
 # kept forgetting.
 DEV_USER="${DEV_USER:-${SUDO_USER:-puma}}"
 
-# SSH directory for deploy keys (root's .ssh directory)
-SSH_DIR="${SSH_DIR:-/root/.ssh}"
-
-# SSH deploy key name for Skyy-Command repo
-KEY_NAME="skyy-command-deploy"
-
-# SSH deploy key paths (private and public)
-DEPLOY_KEY_PATH="${DEPLOY_KEY_PATH:-$SSH_DIR/$KEY_NAME}"
-DEPLOY_KEY_PUB="${DEPLOY_KEY_PUB:-$SSH_DIR/$KEY_NAME.pub}"
-
-# SSH config file path
-SSH_CONFIG="${SSH_CONFIG:-$SSH_DIR/config}"
-
-# SSH host alias for GitHub access via deploy key
-SSH_HOST_ALIAS="skyy-command-github"
+# Where the platform keeps the READ token's delivery copy once a cluster exists
+# (GitHub Automation Standard §1.4). The installer only READS this, to decide
+# whether it must ask. Kept in sync with the ingest script by name, deliberately
+# — the installer cannot import anything from a repo it has not cloned yet.
+PAT_SECRET_NS="${PAT_SECRET_NS:-skyy-command}"
+PAT_SECRET_NAME="${PAT_SECRET_NAME:-github-read}"
+PAT_SECRET_KEY="${PAT_SECRET_KEY:-pat}"
 
 # Git identity configuration (for root user)
 GIT_USER_NAME="${GIT_USER_NAME:-SkyyCommand Platform}"
@@ -76,6 +90,39 @@ log_warn() {
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
+
+# XTRACE IS A LOG, AND THE TOKEN MAY NOT REACH IT. An operator debugging a
+# failed standup runs `curl … | sudo bash -x`, and `set -x` prints every
+# expansion — including the token in `pat_reads_repo`'s argv, in `local token=`,
+# and in the GIT_ASKPASS assignment. The header's "never echoed" and the phase's
+# "no token in argv, a remote URL, .git/config, or a log" both cover this.
+# Every function that HOLDS the value opens with `local -; set +x`. Bash
+# restores the options `local -` saved when the FUNCTION RETURNS, on every path: normal, early, error, and correctly through nesting.
+# A hand-rolled save/restore pair does none of those: one global flag is
+# overwritten by the first nested call (so the outer restore becomes a no-op and
+# the trace is lost for the rest of the run), and every early `return` skips the
+# restore entirely. Measured on this script at pass 2.
+#
+# It is INLINE at each site rather than a shared helper on purpose: `local -` is
+# scoped to the function that runs it, so a helper would restore the options on
+# its OWN return — one frame too early, which is the bug this replaces.
+
+# The token, and the askpass helper that hands it to git. Both die with the
+# script — on every exit path, success and failure alike.
+PAT=""
+ASKPASS_DIR=""
+# The probe's last HTTP status and curl's own stderr — how a REFUSAL is told
+# apart from a FAILURE TO ASK. Never carries the token (it rides a config file).
+PROBE_HTTP_CODE=""
+PROBE_ERR_FILE="$(mktemp)"
+cleanup() {
+    rm -f "$PROBE_ERR_FILE"
+    PAT=""
+    unset GITHUB_READ_PAT
+    [[ -n "$ASKPASS_DIR" && -d "$ASKPASS_DIR" ]] && rm -rf "$ASKPASS_DIR"
+    return 0
+}
+trap cleanup EXIT
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -145,14 +192,16 @@ setup_folder_and_group() {
     local needs_dir_perms=false
     
     # Check ownership on base directory
-    local current_owner=$(stat -c "%U:%G" "$BASE_DIR" 2>/dev/null)
+    local current_owner
+    current_owner=$(stat -c "%U:%G" "$BASE_DIR" 2>/dev/null)
     if [[ "$current_owner" != "root:$GROUP_NAME" ]]; then
         needs_ownership=true
         log_info "Ownership needs update: current=$current_owner, expected=root:$GROUP_NAME"
     fi
     
     # Check directory permissions on base directory
-    local base_dir_perms=$(stat -c "%a" "$BASE_DIR" 2>/dev/null)
+    local base_dir_perms
+    base_dir_perms=$(stat -c "%a" "$BASE_DIR" 2>/dev/null)
     if [[ "$base_dir_perms" != "2775" ]]; then
         needs_dir_perms=true
         log_info "Base directory permissions need update: current=$base_dir_perms, expected=2775"
@@ -241,162 +290,6 @@ setup_folder_and_group() {
     log_info "  POSIX default ACL: g:$GROUP_NAME:rwx (new files are group-writable)"
 }
 
-# Task 1: Bootstrap operator's ~/.ssh/config with wildcard *-github alias block
-#
-# Why this task exists:
-#   After Genesis runs, it writes a per-MDC SSH alias (e.g.
-#   `desired-state-<mdc-id>-github`) into /root/.ssh/config so root can push
-#   to the desired-state repo. But the operator who actually uses the IDE
-#   and runs git commands from their own shell has a separate
-#   ~/.ssh/config — and it never gets the alias. Result: operator can't
-#   push to desired-state from their user account, and every new MDC
-#   stand-up we end up manually copying the block from /root/.ssh/config.
-#
-# Why a wildcard pattern instead of per-MDC entries:
-#   The installer runs BEFORE Genesis generates the mdc_id, so we literally
-#   cannot write the per-MDC alias at this point — the mdc_id doesn't
-#   exist yet. Instead we drop a single `Host *-github` block that matches
-#   any future alias ending in `-github` (skyy-command-github,
-#   skyy-gate-github, desired-state-<mdc-id>-github, …). This is a
-#   one-time setup per operator — every alias Genesis or future tooling
-#   creates automatically inherits the right HostName/User/IdentityFile.
-#
-# Identity file: we point at ~/.ssh/id_ed25519 (the conventional default
-# operator master key). If the operator doesn't have that file we still
-# write the block and warn — they can either generate the key or edit the
-# block to point at whatever key they use.
-#
-# Scope: single-operator MDCs only. Second operators sharing the same MDC
-# copy the block manually (rare enough to not warrant installer logic).
-setup_operator_ssh_config() {
-    log_info "Configuring operator SSH config for '$DEV_USER'..."
-
-    # ---------------------------------------------------------------------
-    # Preflight: can we even proceed?
-    # ---------------------------------------------------------------------
-    # Gracefully skip if the operator user doesn't exist yet — we don't
-    # want the whole installer to abort over a missing dev account.
-    if ! id "$DEV_USER" &>/dev/null; then
-        log_warn "User '$DEV_USER' does not exist, skipping operator SSH config setup"
-        log_warn "To configure SSH for a different operator, re-run with DEV_USER=<name> or ensure \$SUDO_USER is set"
-        return 0
-    fi
-
-    local operator_home operator_group
-    operator_home=$(getent passwd "$DEV_USER" | cut -d: -f6)
-    if [[ -z "$operator_home" || ! -d "$operator_home" ]]; then
-        log_warn "Could not resolve home directory for '$DEV_USER', skipping operator SSH config setup"
-        return 0
-    fi
-
-    # Resolve the operator's actual primary group — don't assume it matches
-    # $DEV_USER. Most distros use user-private-groups (e.g. puma:puma), but
-    # systems provisioned with a shared primary group (e.g. puma:users)
-    # would break a hardcoded "$DEV_USER:$DEV_USER" chown, and SSH rejects
-    # config/dir ownership mismatches.
-    operator_group=$(id -gn "$DEV_USER" 2>/dev/null)
-    if [[ -z "$operator_group" ]]; then
-        log_warn "Could not resolve primary group for '$DEV_USER', skipping operator SSH config setup"
-        return 0
-    fi
-
-    local operator_ssh_dir="$operator_home/.ssh"
-    local operator_ssh_config="$operator_ssh_dir/config"
-    local operator_master_key="$operator_ssh_dir/id_ed25519"
-    local marker_begin="# BEGIN skyy-net installer managed block"
-    local marker_end="# END skyy-net installer managed block"
-
-    # Reject pre-existing symlinks at our write targets — this script runs
-    # as root, so following a symlink planted under $operator_home could
-    # redirect writes to an arbitrary path (e.g. /root/.ssh/config). On a
-    # fresh-VM bootstrap this is unlikely, but the check is cheap and
-    # prevents the foot-gun outright.
-    if [[ -L "$operator_ssh_dir" ]]; then
-        log_warn "$operator_ssh_dir is a symlink — refusing to write to it, skipping operator SSH config setup"
-        return 0
-    fi
-    if [[ -L "$operator_ssh_config" ]]; then
-        log_warn "$operator_ssh_config is a symlink — refusing to write to it, skipping operator SSH config setup"
-        return 0
-    fi
-
-    # ---------------------------------------------------------------------
-    # Write phase: create dir/file and append the managed block
-    # ---------------------------------------------------------------------
-    # Ensure ~/.ssh/ exists with mode 0700 and correct ownership
-    if [[ ! -d "$operator_ssh_dir" ]]; then
-        log_info "Creating $operator_ssh_dir (mode 0700)"
-        mkdir -p "$operator_ssh_dir"
-        chmod 0700 "$operator_ssh_dir"
-        chown "$DEV_USER:$operator_group" "$operator_ssh_dir"
-    else
-        log_info "$operator_ssh_dir already exists"
-    fi
-
-    # Ensure config file exists with mode 0600 and correct ownership
-    if [[ ! -f "$operator_ssh_config" ]]; then
-        log_info "Creating $operator_ssh_config (mode 0600)"
-        touch "$operator_ssh_config"
-        chmod 0600 "$operator_ssh_config"
-        chown "$DEV_USER:$operator_group" "$operator_ssh_config"
-    fi
-
-    # Idempotency: if our marker block is already present, skip. If the
-    # begin marker is present but the end marker is missing, the operator
-    # (or a previous failed run) left the block half-removed — warn rather
-    # than silently duplicate or silently skip.
-    local has_begin has_end
-    grep -qF "$marker_begin" "$operator_ssh_config" && has_begin=1 || has_begin=0
-    grep -qF "$marker_end" "$operator_ssh_config" && has_end=1 || has_end=0
-
-    if [[ $has_begin -eq 1 && $has_end -eq 1 ]]; then
-        log_info "Wildcard *-github alias block already present in $operator_ssh_config (idempotent: skipping)"
-    elif [[ $has_begin -eq 1 && $has_end -eq 0 ]]; then
-        log_warn "Found BEGIN marker but no END marker in $operator_ssh_config"
-        log_warn "  The managed block appears to have been partially deleted."
-        log_warn "  Please remove everything from the BEGIN marker onward and re-run the installer."
-        log_warn "  Skipping to avoid duplicating or corrupting the block."
-    else
-        log_info "Appending wildcard *-github alias block to $operator_ssh_config"
-        # Leading blank line keeps our block visually separated from any
-        # prior content the operator may already have in config.
-        cat >> "$operator_ssh_config" <<EOF
-
-$marker_begin
-# Wildcard alias for any GitHub deploy-key host (skyy-command-github,
-# skyy-gate-github, desired-state-<mdc-id>-github, etc.).
-# Managed by installer/skyy-command/bootstrap.sh — safe to edit, but keep
-# the BEGIN/END markers so re-running the installer is a no-op.
-Host *-github
-    HostName github.com
-    User git
-    IdentityFile ~/.ssh/id_ed25519
-    IdentitiesOnly yes
-$marker_end
-EOF
-        # Re-assert perms/ownership after write (appending can leave
-        # intermediate state if the operator's umask is unusual).
-        chmod 0600 "$operator_ssh_config"
-        chown "$DEV_USER:$operator_group" "$operator_ssh_config"
-        log_info "Wildcard *-github alias block appended"
-    fi
-
-    # Master key sanity check — warn, don't fail. Operators who use a
-    # non-default key name need to edit the IdentityFile line themselves.
-    if [[ ! -f "$operator_master_key" ]]; then
-        log_warn "Operator master key not found at $operator_master_key"
-        log_warn "  The *-github alias block points at ~/.ssh/id_ed25519 by default."
-        log_warn "  You have two options:"
-        log_warn "    1. Generate one: sudo -u $DEV_USER ssh-keygen -t ed25519 -f $operator_master_key -N ''"
-        log_warn "    2. Edit $operator_ssh_config and change 'IdentityFile ~/.ssh/id_ed25519'"
-        log_warn "       to point at whatever key '$DEV_USER' actually uses."
-    else
-        log_info "Operator master key present: $operator_master_key"
-    fi
-
-    log_info "Operator SSH config setup completed"
-}
-
 # Task 2: Install Docker + Compose
 install_docker() {
     log_info "Checking Docker installation..."
@@ -421,7 +314,9 @@ install_docker() {
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         chmod a+r /etc/apt/keyrings/docker.gpg
         
-        # Detect Ubuntu version and set up repository
+        # Detect Ubuntu version and set up repository. The file is the host's,
+        # not this repo's, so shellcheck cannot follow it at lint time.
+        # shellcheck source=/dev/null
         . /etc/os-release
         echo \
           "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
@@ -577,7 +472,8 @@ install_git() {
     log_info "Configuring git identity for root user..."
     
     # Check if git user.name is already configured
-    local current_name=$(git config --global user.name 2>/dev/null || echo "")
+    local current_name
+    current_name=$(git config --global user.name 2>/dev/null || echo "")
     if [[ "$current_name" == "$GIT_USER_NAME" ]]; then
         log_info "Git user.name already configured: $GIT_USER_NAME"
     else
@@ -589,7 +485,8 @@ install_git() {
     fi
     
     # Check if git user.email is already configured
-    local current_email=$(git config --global user.email 2>/dev/null || echo "")
+    local current_email
+    current_email=$(git config --global user.email 2>/dev/null || echo "")
     if [[ "$current_email" == "$GIT_USER_EMAIL" ]]; then
         log_info "Git user.email already configured: $GIT_USER_EMAIL"
     else
@@ -603,282 +500,355 @@ install_git() {
     log_info "Git identity configuration completed"
 }
 
-# Task 5: Configure SSH / deploy key for private GitHub repo
-configure_deploy_key() {
-    log_info "Configuring SSH deploy key for skyy-command repo..."
-    
-    # Ensure SSH directory exists with correct permissions
-    if [[ ! -d "$SSH_DIR" ]]; then
-        log_info "Creating SSH directory: $SSH_DIR"
-        mkdir -p "$SSH_DIR"
-        chmod 700 "$SSH_DIR"
-    else
-        log_info "SSH directory already exists: $SSH_DIR"
-    fi
-    
-    # Check if key already exists
-    local key_exists=false
-    if [[ -f "$DEPLOY_KEY_PATH" && -f "$DEPLOY_KEY_PUB" ]]; then
-        key_exists=true
-        log_info "Deploy key already exists: $DEPLOY_KEY_PATH (idempotent: skipping generation)"
-    else
-        # Generate new Ed25519 key pair
-        log_info "Generating new Ed25519 SSH key pair..."
-        if ssh-keygen -t ed25519 \
-            -f "$DEPLOY_KEY_PATH" \
-            -N "" \
-            -C "skyy-command-deploy-key-$(hostname)-$(date +%Y%m%d)" \
-            -q; then
-            chmod 600 "$DEPLOY_KEY_PATH"
-            chmod 644 "$DEPLOY_KEY_PUB"
-            log_info "SSH key pair generated successfully"
-        else
-            log_error "Failed to generate SSH key pair"
-            return 1
-        fi
-        
-        # Display public key for user to add to GitHub
-        echo ""
-        log_warn "═══════════════════════════════════════════════════════════════"
-        log_warn "ACTION REQUIRED: Add the following public key to GitHub"
-        log_warn "═══════════════════════════════════════════════════════════════"
-        echo ""
-        cat "$DEPLOY_KEY_PUB"
-        echo ""
-        log_warn "Steps to add key to GitHub:"
-        log_warn "  1. Go to: https://github.com/helloskyy-io/Skyy-Command/settings/keys"
-        log_warn "  2. Click 'Add deploy key'"
-        log_warn "  3. Paste the public key above"
-        log_warn "  4. Give the key READ access only (leave the write checkbox unchecked)"
-        log_warn "  5. Click 'Add key'"
-        echo ""
-        log_warn "Press ENTER after you have added the key to GitHub..."
-        read -r
-    fi
-    
-    # Add key to SSH config if not already present (idempotent)
-    if [[ ! -f "$SSH_CONFIG" ]]; then
-        log_info "Creating SSH config file: $SSH_CONFIG"
-        touch "$SSH_CONFIG"
-        chmod 600 "$SSH_CONFIG"
-    fi
-    
-    if ! grep -q "Host $SSH_HOST_ALIAS" "$SSH_CONFIG" 2>/dev/null; then
-        log_info "Adding SSH config entry for skyy-command repo..."
-        cat >> "$SSH_CONFIG" <<EOF
+# ---------------------------------------------------------------------------
+# The credential decision
+# ---------------------------------------------------------------------------
+#
+# The READ token is asked for only when it is NEEDED, and need is decided by
+# questions that can be answered without a token:
+#
+#   both repositories already cloned          -> not needed, never prompt
+#   a clone is needed, and a usable token is
+#     in the environment                      -> use it
+#     in the cluster Secret (a re-run)        -> use it, never prompt
+#   a clone is needed and neither holds one   -> prompt
+#
+# PRESENCE IS NOT VALIDITY. A fine-grained PAT expires after at most 366 days;
+# on that day the Secret still exists and the token in it is dead. Only asking
+# GitHub catches it, so every candidate is validated against the repositories
+# this script clones before it is used.
 
-# Skyy-Command repo deploy key
-Host $SSH_HOST_ALIAS
-    HostName github.com
-    User git
-    IdentityFile $DEPLOY_KEY_PATH
-    IdentitiesOnly yes
-EOF
-        chmod 600 "$SSH_CONFIG"
-        log_info "SSH config updated"
-    else
-        log_info "SSH config entry already exists for $SSH_HOST_ALIAS (idempotent: skipping)"
-    fi
-    
-    # Always test git access (even if key existed - ensures it's properly configured)
-    log_info "Testing SSH connection to GitHub..."
-    local access_verified=false
-    
-    # First try: SSH connection test
-    if ssh -T -o StrictHostKeyChecking=no -o IdentitiesOnly=yes \
-        -i "$DEPLOY_KEY_PATH" \
-        git@github.com 2>&1 | grep -q "successfully authenticated"; then
-        log_info "SSH connection test successful"
-        access_verified=true
-    else
-        log_info "SSH connection test inconclusive (this is normal for deploy keys)"
-        log_info "Attempting direct git repository access test..."
-        
-        # Second try: Direct git repository access test
-        local test_dir="/tmp/mdc_key_test_$$"
-        mkdir -p "$test_dir" || {
-            log_error "Failed to create temporary test directory"
-            return 1
-        }
-        
-        cd "$test_dir" || {
-            log_error "Failed to change to test directory"
-            return 1
-        }
-        
-        # Use SSH config alias for testing
-        local test_url="${GITHUB_REPO/git@github.com:/git@$SSH_HOST_ALIAS:}"
-        if git ls-remote "$test_url" &> /dev/null; then
-            log_info "Git repository access test successful - key is properly configured"
-            access_verified=true
-        else
-            log_error "Git repository access test failed"
-            log_error ""
-            log_error "Troubleshooting steps:"
-            log_error "  1. Verify the public key has been added to GitHub"
-            log_error "     Public key location: $DEPLOY_KEY_PUB"
-            log_error "     GitHub URL: https://github.com/helloskyy-io/Skyy-Command/settings/keys"
-            log_error "  2. Verify the key was added with read access"
-            log_error "  3. Verify the repository exists and is accessible"
-            log_error "  4. If the key was just added, wait a few seconds and try again"
-            log_error ""
-            
-            if [[ "$key_exists" == "true" ]]; then
-                log_warn "Key exists but access test failed - key may not be added to GitHub"
-                log_warn "Displaying public key again for verification:"
-                echo ""
-                cat "$DEPLOY_KEY_PUB"
-                echo ""
-            fi
-        fi
-        
-        cd / || true
-        rm -rf "$test_dir" || true
-    fi
-    
-    # Final verification
-    if [[ "$access_verified" != "true" ]]; then
-        if [[ "${SKIP_KEY_CHECK:-false}" != "true" ]]; then
-            log_error "Git access verification failed - cannot proceed without repository access"
-            log_error "Set SKIP_KEY_CHECK=true to continue anyway (not recommended)"
-            return 1
-        else
-            log_warn "Skipping key check (SKIP_KEY_CHECK=true) - proceeding anyway"
-        fi
-    else
-        log_info "SSH key configuration verified successfully"
-    fi
+# True when at least one clone target is not a valid git repository.
+a_clone_is_needed() {
+    local dir
+    for dir in "$MDC_REPO_DIR" "$COLLECTIONS_REPO_DIR"; do
+        git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || return 0
+    done
+    return 1
 }
 
-# Task 6: Clone MicroDatacenter repo
-clone_repo() {
-    log_info "Checking skyy-command repository..."
-    
-    # Convert GitHub URL to use SSH config alias if deploy key is configured
-    local repo_url="$GITHUB_REPO"
-    if [[ -f "$DEPLOY_KEY_PATH" && -f "$SSH_CONFIG" ]] && \
-       grep -q "Host $SSH_HOST_ALIAS" "$SSH_CONFIG" 2>/dev/null; then
-        # Use SSH config alias: git@github.com -> git@skyy-command-github
-        # Keep the git@ prefix, only replace the hostname
-        repo_url="${GITHUB_REPO/git@github.com:/git@$SSH_HOST_ALIAS:}"
-        log_info "Using SSH config alias: git@$SSH_HOST_ALIAS"
-    else
-        log_warn "SSH config alias not found, using direct GitHub URL"
-        log_warn "This may fail if SSH keys are not properly configured"
+# Reads the token out of the k3s Secret if one is there. Empty on any failure —
+# no k3s, no namespace, no Secret, no key. Every one of those means "we do not
+# have a token", which is the only thing the caller needs to know.
+read_pat_from_cluster() {
+    local -; set +x    # the token is in scope below; xtrace is a log
+    command -v kubectl >/dev/null 2>&1 || return 0
+    [[ -r /etc/rancher/k3s/k3s.yaml ]] || return 0
+    KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n "$PAT_SECRET_NS" \
+        get secret "$PAT_SECRET_NAME" -o "jsonpath={.data.${PAT_SECRET_KEY}}" 2>/dev/null \
+        | base64 -d 2>/dev/null || true
+}
+
+# Asks GitHub whether this token reaches one repository: 200 means yes, and a
+# repository the token does not cover answers 404 — a fine-grained PAT is
+# invisible to what it was not granted. Anything but 200 — expired, revoked,
+# awaiting org approval, wrong scope — means we need a new one.
+pat_reads_repo() {
+    local -; set +x    # the token is in scope below; xtrace is a log
+    local token="$1" repo="$2" code
+    [[ -n "$token" ]] || return 1
+
+    # THE WHOLE CREDENTIAL-BEARING PART RUNS IN A SUBSHELL WITH ITS OWN EXIT
+    # TRAP, and the scoping is the point: the trap and the directory die with
+    # the subshell on every path out — normal return, error, SIGINT, SIGTERM.
+    #
+    # /run, NOT /tmp: Credential Lifecycle §2.6 invariant 1 requires a transient
+    # credential on a memory-backed file, never persistent disk; `mktemp -d`
+    # alone lands in /tmp, which is the root filesystem.
+    #
+    # NO `-f`: with --fail, curl exits non-zero on 4xx AFTER `-w` has printed
+    # the status, and a `|| echo 000` fallback would concatenate to "404000".
+    # A LOCAL failure here (no writable /run) is not a verdict on the network and
+    # not a verdict on the token: exit 3, distinct from every curl outcome, so
+    # the caller can name which thing is broken. make_askpass draws the same line.
+    code="$(
+        cfgdir="$(mktemp -d -p /run)" || exit 3
+        trap 'rm -rf "$cfgdir"' EXIT
+        chmod 700 "$cfgdir"
+        printf 'header = "Authorization: Bearer %s"\n' "$token" > "${cfgdir}/curlrc"
+        chmod 600 "${cfgdir}/curlrc"
+        # curl's own stderr is KEPT (into $PROBE_ERR_FILE) — `-sS` exists to show
+        # the transport error, and discarding it is what made a network fault
+        # indistinguishable from a rejected token. It cannot carry the credential:
+        # the token is in the config file, never in argv or the URL.
+        curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+            --config "${cfgdir}/curlrc" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_OWNER}/${repo}" 2>"$PROBE_ERR_FILE"
+    )"
+    local probe_rc=$?
+    PROBE_HTTP_CODE="${code:-000}"
+    if [[ $probe_rc -eq 3 ]]; then
+        PROBE_HTTP_CODE="local"
+        return 3
     fi
-    
-    # Check if repository already exists and is a valid git repository (idempotent)
-    if [[ -d "$MDC_REPO_DIR" ]] && [[ -d "$MDC_REPO_DIR/.git" ]]; then
-        log_info "Repository directory already exists at: $MDC_REPO_DIR (idempotent: checking validity)"
-        
-        # Verify it's a valid git repository
-        if git -C "$MDC_REPO_DIR" rev-parse --git-dir > /dev/null 2>&1; then
-            log_info "Valid git repository detected"
-            
-            # Update remote URL if it has changed (idempotent)
-            cd "$MDC_REPO_DIR" || {
-                log_error "Failed to change to repository directory: $MDC_REPO_DIR"
-                return 1
-            }
-            
-            local current_remote=$(git remote get-url origin 2>/dev/null || echo "")
-            
-            if [[ "$current_remote" != "$repo_url" ]]; then
-                log_info "Remote URL differs, updating..."
-                log_info "  Current: $current_remote"
-                log_info "  New:     $repo_url"
-                if git remote set-url origin "$repo_url"; then
-                    log_info "Remote URL updated successfully"
-                else
-                    log_warn "Failed to update remote URL, continuing with existing remote"
-                fi
-            else
-                log_info "Remote URL already correct: $repo_url (idempotent: skipping update)"
-            fi
-            
-            # Verify and fix ownership if needed (for IDE access)
-            local repo_owner=$(stat -c "%U:%G" "$MDC_REPO_DIR" 2>/dev/null)
-            if [[ "$repo_owner" != "root:$GROUP_NAME" ]]; then
-                log_info "Repository ownership needs update: current=$repo_owner, expected=root:$GROUP_NAME"
-                log_info "Fixing ownership to ensure IDE access works correctly..."
-                chown -R root:"$GROUP_NAME" "$MDC_REPO_DIR" || {
-                    log_warn "Failed to set ownership on existing repository (non-fatal, continuing)"
-                }
-                # Ensure directory permissions have setgid bit
-                find "$MDC_REPO_DIR" -type d -exec chmod 2775 {} \; || {
-                    log_warn "Failed to set directory permissions (non-fatal, continuing)"
-                }
-                log_info "Repository ownership and permissions updated"
-            else
-                log_info "Repository ownership already correct: root:$GROUP_NAME (idempotent: skipping)"
-            fi
-            
-            # Bootstrap script only ensures repo exists - don't pull updates
-            # (Updates should be handled by separate workflows/processes)
-            log_info "Repository is ready (idempotent: skipping clone/pull)"
-            return 0
-        else
-            log_error "Directory exists but is not a valid git repository: $MDC_REPO_DIR"
-            log_error "This may indicate a corrupted or incomplete clone"
-            log_error "Please remove the directory manually and try again:"
-            log_error "  rm -rf $MDC_REPO_DIR"
-            return 1
+    case "$PROBE_HTTP_CODE" in
+        200) return 0 ;;          # granted
+        401|403|404) return 1 ;;  # GitHub ANSWERED and refused / does not show it
+        *)   return 2 ;;          # 000 (no response), 5xx, anything else: transport
+    esac
+}
+
+# The token must reach BOTH repositories this script clones — that is the
+# READ token's scope per the runbook, and a token that covers one and not the
+# other fails here, naming the one it misses, rather than at the second clone.
+# A REFUSAL and a FAILURE TO ASK are different answers, and telling an operator
+# to re-mint a perfectly good token because the VM's network blipped is the worse
+# of the two mistakes. Returns 0 (both reachable), 1 (GitHub refused — the token
+# is wrong), 2 (transport — the question could not be put to GitHub), or 3 (a
+# LOCAL fault — no writable /run, so the token could not be held to ask at all).
+# 2 and 3 are both "never judged" and have DIFFERENT remedies, so they stay
+# distinct all the way up: collapsing them here is what sent an operator to debug
+# the network on a host whose tmpfs was the problem.
+pat_is_usable() {
+    local -; set +x    # the token is in scope below; xtrace is a log
+    local token="$1" repo rc
+    for repo in "$SKYY_COMMAND_REPO_NAME" "$COLLECTIONS_REPO_NAME"; do
+        pat_reads_repo "$token" "$repo" && continue
+        rc=$?
+        if [[ $rc -eq 3 ]]; then
+            log_error "Could not create a memory-backed directory under /run to hold the token while checking it."
+            log_error "  /run is full or not writable on this host — a LOCAL fault, not the network and not the token."
+            log_error "  The token must not fall back to disk, so the check cannot be made."
+            return 3
         fi
-    elif [[ -e "$MDC_REPO_DIR" ]]; then
-        # Path exists but is not a directory (could be a file)
-        log_error "Path exists but is not a directory: $MDC_REPO_DIR"
-        log_error "Please remove it manually and try again:"
-        log_error "  rm -f $MDC_REPO_DIR"
+        if [[ $rc -eq 2 ]]; then
+            log_error "Could not reach api.github.com to check the token (HTTP ${PROBE_HTTP_CODE})."
+            [[ -s "$PROBE_ERR_FILE" ]] && log_error "  curl: $(tr -d '\r' < "$PROBE_ERR_FILE" | tail -1)"
+            log_error "  This is a NETWORK or API-availability failure, not a verdict on the token."
+            return 2
+        fi
+        log_warn "GitHub refused the token for ${GITHUB_OWNER}/${repo} (HTTP ${PROBE_HTTP_CODE})"
         return 1
-    else
-        # Repository doesn't exist, clone it
-        log_info "Repository not found, cloning from: $repo_url"
-        log_info "Target directory: $MDC_REPO_DIR"
-        
-        # Ensure parent directory exists
-        local parent_dir=$(dirname "$MDC_REPO_DIR")
-        if [[ ! -d "$parent_dir" ]]; then
-            log_info "Creating parent directory: $parent_dir"
-            mkdir -p "$parent_dir" || {
-                log_error "Failed to create parent directory: $parent_dir"
-                return 1
-            }
-        fi
-        
-        log_info "Cloning repository (this may take a moment)..."
-        if git clone "$repo_url" "$MDC_REPO_DIR"; then
-            log_info "Repository cloned successfully"
-            log_info "Location: $MDC_REPO_DIR"
-            
-            # Fix ownership of cloned files to ensure correct group (for IDE access)
-            log_info "Setting ownership of cloned repository to root:$GROUP_NAME..."
-            chown -R root:"$GROUP_NAME" "$MDC_REPO_DIR" || {
-                log_warn "Failed to set ownership on cloned repository (non-fatal, continuing)"
-            }
-            
-            # Ensure directory permissions have setgid bit (so new files inherit group)
-            log_info "Setting directory permissions with setgid bit..."
-            find "$MDC_REPO_DIR" -type d -exec chmod 2775 {} \; || {
-                log_warn "Failed to set directory permissions (non-fatal, continuing)"
-            }
-            
-            log_info "Repository ownership and permissions configured"
-            log_info "  Owner: root"
-            log_info "  Group: $GROUP_NAME"
-            log_info "  Directory permissions: 2775 (setgid - new files inherit group)"
-        else
-            log_error "Failed to clone repository"
-            log_error "Please verify:"
-            log_error "  1. SSH key has been added to GitHub"
-            log_error "  2. Repository URL is correct: $repo_url"
-            log_error "  3. Network connectivity is available"
-            log_error "  4. You have access to the repository"
-            return 1
-        fi
+    done
+    return 0
+}
+
+# Sets PAT, or exits. Order is cheapest-first: an env var costs nothing to
+# check, the cluster costs a kubectl call, and only if both come up empty is a
+# human interrupted.
+resolve_pat() {
+    local -; set +x    # the token is in scope below; xtrace is a log
+    local rc
+    if [[ -n "${GITHUB_READ_PAT:-}" ]]; then
+        log_info "Token supplied in the environment; validating..."
+        pat_is_usable "$GITHUB_READ_PAT" && { PAT="$GITHUB_READ_PAT"; log_info "Token valid for ${SKYY_COMMAND_REPO_NAME} and ${COLLECTIONS_REPO_NAME}"; return 0; }
+        rc=$?
+        [[ $rc -eq 3 ]] && { log_error "Fix /run on this host and re-run; the token was never judged."; exit 1; }
+        [[ $rc -eq 2 ]] && { log_error "Fix the network (or wait for the API) and re-run; the token was never judged."; exit 1; }
+        log_error "GITHUB_READ_PAT is set but GitHub refused it for the repositories above."
+        log_error "  Expired, revoked, awaiting org approval, or missing Contents:Read on one of them."
+        exit 1
+    fi
+
+    local existing
+    existing="$(read_pat_from_cluster)"
+    if [[ -n "$existing" ]]; then
+        log_info "Found the READ token in the k3s Secret ${PAT_SECRET_NS}/${PAT_SECRET_NAME}; validating..."
+        pat_is_usable "$existing" && { PAT="$existing"; log_info "Stored token is valid — not asking you for one"; return 0; }
+        rc=$?
+        [[ $rc -eq 3 ]] && { log_error "Fix /run on this host and re-run; the stored token was never judged."; exit 1; }
+        [[ $rc -eq 2 ]] && { log_error "Fix the network (or wait for the API) and re-run; the stored token was never judged."; exit 1; }
+        log_warn "The stored token is present but GitHub REFUSED it for these repositories."
+        log_warn "  Fine-grained tokens expire after at most 366 days; this is the usual cause."
+        log_warn "  A new one is needed — mint and re-place it per guide/github_credentials.md."
+    fi
+
+    # READ FROM THE TERMINAL, NOT STDIN. Under `curl | bash`, stdin IS the
+    # script — a plain `read` would consume the next lines of this file and
+    # execute nothing. /dev/tty is the operator's keyboard regardless of how
+    # the script arrived.
+    if [[ ! -r /dev/tty ]]; then
+        log_error "A token is needed and there is no terminal to ask on."
+        log_error "  Re-run interactively, or set GITHUB_READ_PAT and use 'sudo -E'."
+        exit 1
+    fi
+
+    echo "" >&2
+    log_info "The MDC's READ token is needed to clone ${GITHUB_OWNER}/${SKYY_COMMAND_REPO_NAME}"
+    log_info "and ${GITHUB_OWNER}/${COLLECTIONS_REPO_NAME}."
+    log_info "  A GitHub fine-grained token, READ-ONLY, covering those repositories:"
+    log_info "    Contents: Read-only   (Metadata sets itself)"
+    log_info "  The mint is the runbook's: mdc-master-planning/guide/github_credentials.md"
+    echo "" >&2
+    printf "Paste the READ token (input hidden): " >&2
+    read -rs PAT < /dev/tty
+    echo "" >&2
+
+    if [[ -z "$PAT" ]]; then
+        log_error "No token entered."
+        exit 1
+    fi
+    pat_is_usable "$PAT" || {
+        rc=$?
+        [[ $rc -eq 3 ]] && { log_error "The token you pasted was never judged — fix /run on this host and re-run."; exit 1; }
+        [[ $rc -eq 2 ]] && { log_error "The token you pasted was never judged — fix the network and re-run."; exit 1; }
+        log_error "GitHub refused that token for one of the two repositories."
+        log_error "  Check: org approval, Contents:Read, and that BOTH repositories are selected."
+        exit 1
+    }
+    log_info "Token valid for ${SKYY_COMMAND_REPO_NAME} and ${COLLECTIONS_REPO_NAME}"
+}
+
+# The askpass helper, created once so every clone can use it. The token's VALUE
+# is never in the file — only a reference to the environment.
+make_askpass() {
+    [[ -n "$ASKPASS_DIR" ]] && return 0
+    # CHECKED, because the only caller reaches this from inside an `if !` where
+    # `set -e` is suppressed: an unchecked failure leaves ASKPASS_DIR empty, the
+    # helper is written to `/askpass.sh` at the filesystem root, and cleanup's
+    # `[[ -n "$ASKPASS_DIR" ]]` guard cannot remove what it cannot name.
+    ASKPASS_DIR="$(mktemp -d -p /run)" || {
+        log_error "Could not create a memory-backed directory under /run for the git credential helper."
+        log_error "  /run is full or not writable; the token must not fall back to disk."
+        exit 1
+    }
+    chmod 700 "$ASKPASS_DIR"
+    cat > "${ASKPASS_DIR}/askpass.sh" <<'ASKPASS'
+#!/usr/bin/env bash
+case "$1" in
+    Username*) echo "x-access-token" ;;
+    *)         echo "${GITHUB_READ_PAT_INTERNAL}" ;;
+esac
+ASKPASS
+    chmod 700 "${ASKPASS_DIR}/askpass.sh"
+}
+
+# Runs git with the token supplied through GIT_ASKPASS. THE FOUR SURFACES THE
+# TOKEN MUST NOT REACH, and how each is closed:
+#   argv        -> GIT_ASKPASS supplies it; never an argument
+#   remote URL  -> the URL in .git/config carries no credential
+#   .git/config -> follows from the above, and is ASSERTED after every clone
+#   cred store  -> `-c credential.helper=` neutralises any inherited helper
+# Same shape as skyy-command's activities/git/_pat_auth.py, in shell, because
+# the installer runs before any of that code is on the box.
+git_with_token() {
+    make_askpass
+    local -; set +x    # the token is in scope below; xtrace is a log
+    local rc=0
+    GITHUB_READ_PAT_INTERNAL="$PAT" GIT_ASKPASS="${ASKPASS_DIR}/askpass.sh" \
+        GIT_TERMINAL_PROMPT=0 git -c credential.helper= "$@" || rc=$?
+    return $rc
+}
+
+# ---------------------------------------------------------------------------
+# Task 5: the two repositories
+# ---------------------------------------------------------------------------
+
+# Ownership for IDE access: root:$GROUP_NAME, setgid directories so new files
+# inherit the group.
+fix_repo_ownership() {
+    local dir="$1"
+    chown -R root:"$GROUP_NAME" "$dir" || {
+        log_warn "Failed to set ownership on $dir (non-fatal, continuing)"
+    }
+    find "$dir" -type d -exec chmod 2775 {} \; || {
+        log_warn "Failed to set directory permissions on $dir (non-fatal, continuing)"
+    }
+}
+
+# Asserted rather than assumed: a token in .git/config is exactly the durable
+# copy this script exists to avoid, and it would outlive every later stage.
+assert_remote_is_clean() {
+    local dir="$1" origin
+    origin="$(git -C "$dir" remote get-url origin 2>/dev/null || echo "")"
+    if [[ "$origin" == https://*@* ]]; then
+        log_error "Stored remote of $dir contains a credential — refusing to continue."
+        log_error "  A token is written into that clone's .git/config, where it outlives this run;"
+        log_error "  rewriting the URL would not un-leak it. Do this instead:"
+        log_error "    1. Treat the embedded token as compromised — revoke and re-mint it"
+        log_error "       (mdc-master-planning/guide/github_credentials.md)."
+        log_error "    2. Clear the stored remote, or delete the clone and let this installer"
+        log_error "       make a clean one:"
+        log_error "         sudo git -C $dir remote set-url origin https://github.com/${GITHUB_OWNER}/<repo>.git"
+        log_error "    3. Re-run this installer."
+        exit 1
     fi
 }
 
-# Task 7: Launch private bootstrap script
+# One repository, converged: present as a valid git repository, origin at the
+# clean HTTPS URL, owned for IDE access. Clones over the READ token when absent.
+# An existing checkout is not pulled — updates are other workflows' — but its
+# origin is moved to the clean URL: the platform reaches GitHub over HTTPS with
+# a token, and an SSH-alias remote resolves to a key the platform does not hold.
+ensure_repo_cloned() {
+    local repo="$1" dir="$2"
+    local clean_url="https://github.com/${GITHUB_OWNER}/${repo}.git"
+
+    if git -C "$dir" rev-parse --git-dir >/dev/null 2>&1; then
+        log_info "Repository present at $dir (idempotent: skipping clone/pull)"
+
+        # ASSERT BEFORE LOGGING. A stored remote is the one string here that can
+        # carry a credential now that the platform reaches GitHub over HTTPS
+        # (on the SSH model it never could), and this function's own contract is
+        # that no token reaches a log. So the credential-free check runs first,
+        # and the old URL is never printed either way — a changed remote is
+        # reported as the fact it is.
+        assert_remote_is_clean "$dir"
+
+        local current_remote
+        current_remote="$(git -C "$dir" remote get-url origin 2>/dev/null || echo "")"
+        if [[ "$current_remote" != "$clean_url" ]]; then
+            log_info "Moving origin to the clean HTTPS URL: $clean_url"
+            git -C "$dir" remote set-url origin "$clean_url" || {
+                log_error "Failed to set origin on $dir"
+                return 1
+            }
+        else
+            log_info "Origin already correct: $clean_url"
+        fi
+
+        local repo_owner
+        repo_owner="$(stat -c "%U:%G" "$dir" 2>/dev/null)"
+        if [[ "$repo_owner" != "root:$GROUP_NAME" ]]; then
+            log_info "Repository ownership needs update: current=$repo_owner, expected=root:$GROUP_NAME"
+            fix_repo_ownership "$dir"
+        else
+            log_info "Repository ownership already correct: root:$GROUP_NAME"
+        fi
+        return 0
+    fi
+
+    if [[ -d "$dir" ]]; then
+        log_error "Directory exists but is not a valid git repository: $dir"
+        log_error "This may indicate a corrupted or incomplete clone"
+        log_error "Please remove the directory manually and try again:"
+        log_error "  rm -rf $dir"
+        return 1
+    elif [[ -e "$dir" ]]; then
+        log_error "Path exists but is not a directory: $dir"
+        log_error "Please remove it manually and try again:"
+        log_error "  rm -f $dir"
+        return 1
+    fi
+
+    local parent_dir
+    parent_dir="$(dirname "$dir")"
+    if [[ ! -d "$parent_dir" ]]; then
+        log_info "Creating parent directory: $parent_dir"
+        mkdir -p "$parent_dir" || {
+            log_error "Failed to create parent directory: $parent_dir"
+            return 1
+        }
+    fi
+
+    log_info "Cloning ${GITHUB_OWNER}/${repo} to $dir (this may take a moment)..."
+    if ! git_with_token clone "$clean_url" "$dir"; then
+        log_error "Clone of ${GITHUB_OWNER}/${repo} failed despite a token that validated moments ago."
+        log_error "  Network, or the repository's default branch is not clonable."
+        return 1
+    fi
+    assert_remote_is_clean "$dir"
+    fix_repo_ownership "$dir"
+    log_info "Repository cloned: $dir (root:$GROUP_NAME, directories 2775)"
+}
+
+clone_repos() {
+    ensure_repo_cloned "$SKYY_COMMAND_REPO_NAME" "$MDC_REPO_DIR" || return 1
+    ensure_repo_cloned "$COLLECTIONS_REPO_NAME" "$COLLECTIONS_REPO_DIR" || return 1
+}
+
+# Task 6: Launch private bootstrap script
 launch_private_bootstrap() {
     log_info "Preparing to launch private bootstrap script from skyy-command..."
     
@@ -1012,91 +982,87 @@ main() {
     log_info "Starting installation tasks..."
     echo ""
     
-    log_info "[Task 0/7] Setting up folder structure and user group..."
+    log_info "[Task 0/6] Setting up folder structure and user group..."
     if setup_folder_and_group; then
-        log_info "[Task 0/7] ✓ Completed"
+        log_info "[Task 0/6] ✓ Completed"
     else
-        log_error "[Task 0/7] ✗ Failed"
+        log_error "[Task 0/6] ✗ Failed"
         log_error "Failed to setup folder structure and group"
         log_error "This is a critical error - cannot proceed without base directory"
         exit 1
     fi
     echo ""
 
-    log_info "[Task 1/7] Configuring operator SSH config (wildcard *-github alias)..."
-    if setup_operator_ssh_config; then
-        log_info "[Task 1/7] ✓ Completed"
+    # The one human interruption, taken FIRST — before the long installs —
+    # and only when a clone is actually needed.
+    log_info "[Task 1/6] Deciding whether the READ token is needed..."
+    if a_clone_is_needed; then
+        resolve_pat
     else
-        log_error "[Task 1/7] ✗ Failed"
-        log_error "Failed to configure operator SSH config"
-        exit 1
+        log_info "Both repositories are already cloned — no token needed"
     fi
+    log_info "[Task 1/6] ✓ Completed"
     echo ""
 
-    log_info "[Task 2/7] Installing Docker and Docker Compose..."
+    log_info "[Task 2/6] Installing Docker and Docker Compose..."
     if install_docker; then
-        log_info "[Task 2/7] ✓ Completed"
+        log_info "[Task 2/6] ✓ Completed"
     else
-        log_error "[Task 2/7] ✗ Failed"
+        log_error "[Task 2/6] ✗ Failed"
         log_error "Failed to install Docker"
         log_error "Docker is required for Temporal infrastructure"
         exit 1
     fi
     echo ""
 
-    log_info "[Task 3/7] Installing Helm..."
+    log_info "[Task 3/6] Installing Helm..."
     if install_helm; then
-        log_info "[Task 3/7] ✓ Completed"
+        log_info "[Task 3/6] ✓ Completed"
     else
-        log_error "[Task 3/7] ✗ Failed"
+        log_error "[Task 3/6] ✗ Failed"
         log_error "Failed to install helm"
         log_error "helm is required by the private bootstrap's chart-rendering pipeline"
         exit 1
     fi
     echo ""
 
-    log_info "[Task 4/7] Installing Git and configuring identity..."
+    log_info "[Task 4/6] Installing Git and configuring identity..."
     if install_git; then
-        log_info "[Task 4/7] ✓ Completed"
+        log_info "[Task 4/6] ✓ Completed"
     else
-        log_error "[Task 4/7] ✗ Failed"
+        log_error "[Task 4/6] ✗ Failed"
         log_error "Failed to install Git"
-        log_error "Git is required to clone the skyy-command repository"
+        log_error "Git is required to clone the repositories"
         exit 1
     fi
     echo ""
 
-    log_info "[Task 5/7] Configuring SSH deploy key for skyy-command repository..."
-    if configure_deploy_key; then
-        log_info "[Task 5/7] ✓ Completed"
+    log_info "[Task 5/6] Cloning skyy-command and mdc-ansible-collections..."
+    if clone_repos; then
+        log_info "[Task 5/6] ✓ Completed"
     else
-        log_error "[Task 5/7] ✗ Failed"
-        log_error "Failed to configure deploy key"
-        log_error "SSH key is required to access the private skyy-command repository"
-        log_error "Please ensure the key was added to GitHub and try again"
-        exit 1
-    fi
-    echo ""
-
-    log_info "[Task 6/7] Cloning skyy-command repository..."
-    if clone_repo; then
-        log_info "[Task 6/7] ✓ Completed"
-    else
-        log_error "[Task 6/7] ✗ Failed"
-        log_error "Failed to clone skyy-command repository"
+        log_error "[Task 5/6] ✗ Failed"
+        log_error "Failed to clone the repositories"
         log_error "Please verify:"
-        log_error "  - SSH key has been added to GitHub"
-        log_error "  - Repository exists and is accessible"
+        log_error "  - The READ token covers both repositories with Contents: Read"
         log_error "  - Network connectivity is available"
         exit 1
     fi
     echo ""
 
-    log_info "[Task 7/7] Launching private bootstrap script..."
+    # The token has done its only job. It is not the private bootstrap's to
+    # inherit here — nothing downstream in this run reads it. BOTH carriers are
+    # cleared: the shell variable, and the EXPORTED environment variable an
+    # unattended `sudo -E` run was started with — `launch_private_bootstrap`
+    # runs `bash`, and a child inherits the environment, not the shell locals.
+    PAT=""
+    unset GITHUB_READ_PAT
+
+    log_info "[Task 6/6] Launching private bootstrap script..."
     if launch_private_bootstrap; then
-        log_info "[Task 7/7] ✓ Completed"
+        log_info "[Task 6/6] ✓ Completed"
     else
-        log_error "[Task 7/7] ✗ Failed"
+        log_error "[Task 6/6] ✗ Failed"
         log_error "Failed to launch private bootstrap script"
         log_error "Please review the private bootstrap output above for details"
         exit 1
@@ -1107,8 +1073,8 @@ main() {
     log_info "═══════════════════════════════════════════════════════════════"
     log_info "Public Installer Completed Successfully"
     log_info "═══════════════════════════════════════════════════════════════"
-    log_info "The folder structure, deploy key, and skyy-command repo are in place,"
-    log_info "and the private bootstrap script has been launched (output above)."
+    log_info "The folder structure and the skyy-command and mdc-ansible-collections"
+    log_info "repos are in place, and the private bootstrap has been launched (output above)."
     log_info ""
     log_info "Follow the instructions printed by the private bootstrap above:"
     log_info "  - On a fresh VM, the bootstrap will have created config.yaml and .env"
