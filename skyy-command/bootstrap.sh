@@ -91,6 +91,22 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# XTRACE IS A LOG, AND THE TOKEN MAY NOT REACH IT. An operator debugging a
+# failed standup runs `curl … | sudo bash -x`, and `set -x` prints every
+# expansion — including the token in `pat_reads_repo`'s argv, in `local token=`,
+# and in the GIT_ASKPASS assignment. The header's "never echoed" and the phase's
+# "no token in argv, a remote URL, .git/config, or a log" both cover this.
+# Every function that HOLDS the value brackets itself with these two: xtrace off
+# on entry, restored to whatever it was on exit. Control flow still traces; the
+# credential does not.
+_hide_xtrace() {
+    case $- in *x*) _XTRACE_WAS_ON=1; set +x ;; *) _XTRACE_WAS_ON=0 ;; esac
+}
+_restore_xtrace() {
+    [[ "${_XTRACE_WAS_ON:-0}" -eq 1 ]] && set -x
+    return 0
+}
+
 # The token, and the askpass helper that hands it to git. Both die with the
 # script — on every exit path, success and failure alike.
 PAT=""
@@ -509,11 +525,13 @@ a_clone_is_needed() {
 # no k3s, no namespace, no Secret, no key. Every one of those means "we do not
 # have a token", which is the only thing the caller needs to know.
 read_pat_from_cluster() {
-    command -v kubectl >/dev/null 2>&1 || return 0
-    [[ -r /etc/rancher/k3s/k3s.yaml ]] || return 0
+    _hide_xtrace
+    command -v kubectl >/dev/null 2>&1 || { _restore_xtrace; return 0; }
+    [[ -r /etc/rancher/k3s/k3s.yaml ]] || { _restore_xtrace; return 0; }
     KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n "$PAT_SECRET_NS" \
         get secret "$PAT_SECRET_NAME" -o "jsonpath={.data.${PAT_SECRET_KEY}}" 2>/dev/null \
         | base64 -d 2>/dev/null || true
+    _restore_xtrace
 }
 
 # Asks GitHub whether this token reaches one repository: 200 means yes, and a
@@ -521,8 +539,9 @@ read_pat_from_cluster() {
 # invisible to what it was not granted. Anything but 200 — expired, revoked,
 # awaiting org approval, wrong scope — means we need a new one.
 pat_reads_repo() {
+    _hide_xtrace
     local token="$1" repo="$2" code
-    [[ -n "$token" ]] || return 1
+    [[ -n "$token" ]] || { _restore_xtrace; return 1; }
 
     # THE WHOLE CREDENTIAL-BEARING PART RUNS IN A SUBSHELL WITH ITS OWN EXIT
     # TRAP, and the scoping is the point: the trap and the directory die with
@@ -534,8 +553,11 @@ pat_reads_repo() {
     #
     # NO `-f`: with --fail, curl exits non-zero on 4xx AFTER `-w` has printed
     # the status, and a `|| echo 000` fallback would concatenate to "404000".
+    # A LOCAL failure here (no writable /run) is not a verdict on the network and
+    # not a verdict on the token: exit 3, distinct from every curl outcome, so
+    # the caller can name which thing is broken. make_askpass draws the same line.
     code="$(
-        cfgdir="$(mktemp -d -p /run)" || exit 1
+        cfgdir="$(mktemp -d -p /run)" || exit 3
         trap 'rm -rf "$cfgdir"' EXIT
         chmod 700 "$cfgdir"
         printf 'header = "Authorization: Bearer %s"\n' "$token" > "${cfgdir}/curlrc"
@@ -549,7 +571,13 @@ pat_reads_repo() {
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${GITHUB_OWNER}/${repo}" 2>"$PROBE_ERR_FILE"
     )"
+    local probe_rc=$?
     PROBE_HTTP_CODE="${code:-000}"
+    _restore_xtrace
+    if [[ $probe_rc -eq 3 ]]; then
+        PROBE_HTTP_CODE="local"
+        return 3
+    fi
     case "$PROBE_HTTP_CODE" in
         200) return 0 ;;          # granted
         401|403|404) return 1 ;;  # GitHub ANSWERED and refused / does not show it
@@ -565,10 +593,18 @@ pat_reads_repo() {
 # of the two mistakes. Returns 0 (both reachable), 1 (GitHub refused — the token
 # is wrong), or 2 (the question could not be put — transport).
 pat_is_usable() {
+    _hide_xtrace
     local token="$1" repo rc
     for repo in "$SKYY_COMMAND_REPO_NAME" "$COLLECTIONS_REPO_NAME"; do
         pat_reads_repo "$token" "$repo" && continue
         rc=$?
+        if [[ $rc -eq 3 ]]; then
+            log_error "Could not create a memory-backed directory under /run to hold the token while checking it."
+            log_error "  /run is full or not writable on this host — a LOCAL fault, not the network and not the token."
+            log_error "  The token must not fall back to disk, so the check cannot be made."
+            _restore_xtrace
+            return 2
+        fi
         if [[ $rc -eq 2 ]]; then
             log_error "Could not reach api.github.com to check the token (HTTP ${PROBE_HTTP_CODE})."
             [[ -s "$PROBE_ERR_FILE" ]] && log_error "  curl: $(tr -d '\r' < "$PROBE_ERR_FILE" | tail -1)"
@@ -576,8 +612,10 @@ pat_is_usable() {
             return 2
         fi
         log_warn "GitHub refused the token for ${GITHUB_OWNER}/${repo} (HTTP ${PROBE_HTTP_CODE})"
+        _restore_xtrace
         return 1
     done
+    _restore_xtrace
     return 0
 }
 
@@ -585,6 +623,7 @@ pat_is_usable() {
 # check, the cluster costs a kubectl call, and only if both come up empty is a
 # human interrupted.
 resolve_pat() {
+    _hide_xtrace
     if [[ -n "${GITHUB_READ_PAT:-}" ]]; then
         log_info "Token supplied in the environment; validating..."
         pat_is_usable "$GITHUB_READ_PAT" && { PAT="$GITHUB_READ_PAT"; log_info "Token valid for ${SKYY_COMMAND_REPO_NAME} and ${COLLECTIONS_REPO_NAME}"; return 0; }
@@ -637,6 +676,7 @@ resolve_pat() {
         exit 1
     }
     log_info "Token valid for ${SKYY_COMMAND_REPO_NAME} and ${COLLECTIONS_REPO_NAME}"
+    _restore_xtrace
 }
 
 # The askpass helper, created once so every clone can use it. The token's VALUE
@@ -673,8 +713,12 @@ ASKPASS
 # the installer runs before any of that code is on the box.
 git_with_token() {
     make_askpass
+    _hide_xtrace
+    local rc=0
     GITHUB_READ_PAT_INTERNAL="$PAT" GIT_ASKPASS="${ASKPASS_DIR}/askpass.sh" \
-        GIT_TERMINAL_PROMPT=0 git -c credential.helper= "$@"
+        GIT_TERMINAL_PROMPT=0 git -c credential.helper= "$@" || rc=$?
+    _restore_xtrace
+    return $rc
 }
 
 # ---------------------------------------------------------------------------
@@ -700,6 +744,14 @@ assert_remote_is_clean() {
     origin="$(git -C "$dir" remote get-url origin 2>/dev/null || echo "")"
     if [[ "$origin" == https://*@* ]]; then
         log_error "Stored remote of $dir contains a credential — refusing to continue."
+        log_error "  A token is written into that clone's .git/config, where it outlives this run;"
+        log_error "  rewriting the URL would not un-leak it. Do this instead:"
+        log_error "    1. Treat the embedded token as compromised — revoke and re-mint it"
+        log_error "       (mdc-master-planning/guide/github_credentials.md)."
+        log_error "    2. Clear the stored remote, or delete the clone and let this installer"
+        log_error "       make a clean one:"
+        log_error "         sudo git -C $dir remote set-url origin https://github.com/${GITHUB_OWNER}/<repo>.git"
+        log_error "    3. Re-run this installer."
         exit 1
     fi
 }
