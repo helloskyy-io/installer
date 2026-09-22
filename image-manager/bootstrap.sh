@@ -161,8 +161,12 @@ pat_is_usable() {
     # printed the status, so `|| echo "000"` appended and produced "401000".
     # Harmless while the only test is equality with 200, and wrong for anything
     # that reads the value.
+    # A LOCAL failure here (no writable /run) is not a verdict on the network and
+    # not a verdict on the token: exit 3, distinct from every curl outcome, so the
+    # caller can name which thing is broken rather than sending an operator to
+    # debug a network that is fine.
     code="$(
-        cfgdir="$(mktemp -d -p /run)" || exit 1
+        cfgdir="$(mktemp -d -p /run)" || exit 3
         trap 'rm -rf "$cfgdir"' EXIT
         chmod 700 "$cfgdir"
         printf 'header = "Authorization: Bearer %s"\n' "$token" > "${cfgdir}/curlrc"
@@ -172,6 +176,13 @@ pat_is_usable() {
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}" 2>/dev/null
     )"
+    local probe_rc=$?
+    if [[ $probe_rc -eq 3 ]]; then
+        log_error "Could not create a memory-backed directory under /run to hold the token while checking it."
+        log_error "  /run is full or not writable on this host — a LOCAL fault, not the network and not the token."
+        log_error "  The token must not fall back to disk, so the check cannot be made."
+        return 3
+    fi
     [[ "${code:-000}" == "200" ]]
 }
 
@@ -182,11 +193,8 @@ resolve_pat() {
     local -; set +x    # the token is in scope below; xtrace is a log
     if [[ -n "${IMAGE_MANAGER_PAT:-}" ]]; then
         log_info "Token supplied in the environment; validating..."
-        if pat_is_usable "$IMAGE_MANAGER_PAT"; then
-            PAT="$IMAGE_MANAGER_PAT"
-            log_info "Token valid for ${REPO_OWNER}/${REPO_NAME}"
-            return 0
-        fi
+        pat_is_usable "$IMAGE_MANAGER_PAT" && { PAT="$IMAGE_MANAGER_PAT"; log_info "Token valid for ${REPO_OWNER}/${REPO_NAME}"; return 0; }
+        [[ $? -eq 3 ]] && { log_error "Fix /run on this host and re-run; the token was never judged."; exit 1; }
         log_error "IMAGE_MANAGER_PAT is set but cannot read ${REPO_OWNER}/${REPO_NAME}."
         log_error "  Expired, revoked, awaiting org approval, or missing Contents:Read."
         exit 1
@@ -196,11 +204,8 @@ resolve_pat() {
     existing="$(read_pat_from_cluster)"
     if [[ -n "$existing" ]]; then
         log_info "Found a token in the k3s Secret; validating..."
-        if pat_is_usable "$existing"; then
-            PAT="$existing"
-            log_info "Stored token is valid — not asking you for one"
-            return 0
-        fi
+        pat_is_usable "$existing" && { PAT="$existing"; log_info "Stored token is valid — not asking you for one"; return 0; }
+        [[ $? -eq 3 ]] && { log_error "Fix /run on this host and re-run; the stored token was never judged."; exit 1; }
         log_warn "The stored token is present but NO LONGER VALID."
         log_warn "  Fine-grained tokens expire after at most 366 days; this is the usual cause."
         log_warn "  A new one is needed. Stage 2 will replace the stored copy."
@@ -230,11 +235,12 @@ resolve_pat() {
         log_error "No token entered."
         exit 1
     fi
-    if ! pat_is_usable "$PAT"; then
+    pat_is_usable "$PAT" || {
+        [[ $? -eq 3 ]] && { log_error "The token you pasted was never judged — fix /run on this host and re-run."; exit 1; }
         log_error "That token cannot read ${REPO_OWNER}/${REPO_NAME}."
         log_error "  Check: org approval, Contents:Read, and that the repo is selected."
         exit 1
-    fi
+    }
     log_info "Token valid for ${REPO_OWNER}/${REPO_NAME}"
 }
 
@@ -411,6 +417,11 @@ assert_remote_is_clean() {
 # Stage 2 is what writes the durable copy into a k3s Secret, once a cluster
 # encrypted at rest exists to hold it.
 hand_off_to_stage_2() {
+    # The env-assignment prefix below is traced WITH its value, so this function
+    # holds the token too — the guard belongs here as much as in the four that
+    # read it. (The restore never runs because `exec` replaces the process; that
+    # is correct, and it is why the guard must be the LAST thing standing.)
+    local -; set +x
     local next="${REPO_DIR}/bootstrap.sh"
     if [[ ! -f "$next" ]]; then
         log_error "Stage 2 not found at $next"
