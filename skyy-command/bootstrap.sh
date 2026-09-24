@@ -129,6 +129,15 @@ check_root() {
         log_error "This script must be run as root"
         exit 1
     fi
+    # PIN HOME. Everything this script configures belongs to root, and
+    # `git config --global` resolves its file from $HOME with no opinion about
+    # who is running. `sudo` supplies HOME=/root, but the two invocations this
+    # script's own header recommends do not: `sudo -E` preserves the operator's
+    # HOME (root then writes the platform identity into /home/<operator>/.gitconfig
+    # and leaves it root-owned), and a systemd unit supplies no HOME at all
+    # (`fatal: $HOME not set`, Task 4 dies). Neither is hypothetical; both were
+    # measured. Pinning here covers every caller instead of one.
+    export HOME=/root
 }
 
 # Task 0: Create folder structure and user group
@@ -658,7 +667,13 @@ resolve_pat() {
     # script — a plain `read` would consume the next lines of this file and
     # execute nothing. /dev/tty is the operator's keyboard regardless of how
     # the script arrived.
-    if [[ ! -r /dev/tty ]]; then
+    # TESTED BY OPENING, NOT BY STAT. `[[ -r /dev/tty ]]` asks the filesystem
+    # about a character device that exists with mode 0666 on every Linux box —
+    # it passes with no controlling terminal, so this guard could not fire and
+    # the operator got a bare `/dev/tty: No such device or address` from the
+    # read eleven lines below instead of the two lines under it. Opening is the
+    # condition that actually matters, and it is the one the read performs.
+    if ! : < /dev/tty 2>/dev/null; then
         log_error "A token is needed and there is no terminal to ask on."
         log_error "  Re-run interactively, or set GITHUB_READ_PAT and use 'sudo -E'."
         exit 1
@@ -698,9 +713,17 @@ make_askpass() {
     # `set -e` is suppressed: an unchecked failure leaves ASKPASS_DIR empty, the
     # helper is written to `/askpass.sh` at the filesystem root, and cleanup's
     # `[[ -n "$ASKPASS_DIR" ]]` guard cannot remove what it cannot name.
-    ASKPASS_DIR="$(mktemp -d -p /run)" || {
-        log_error "Could not create a memory-backed directory under /run for the git credential helper."
-        log_error "  /run is full or not writable; the token must not fall back to disk."
+    # NOT UNDER /run, AND THE REASON IS THE LINE ABOVE: the token's value is
+    # never in this file, only the name of an environment variable. So there is
+    # no secret here for a memory-backed filesystem to protect — and `/run` is
+    # mounted `noexec` on stock Ubuntu, while GIT_ASKPASS must point at
+    # something git can EXECUTE. Under `-p /run` every clone died with
+    # `fatal: cannot exec '/run/tmp.XXXX/askpass.sh': Permission denied`,
+    # measured on two machines. `image-manager/bootstrap.sh` has always used the
+    # default directory here and is the sibling that works.
+    ASKPASS_DIR="$(mktemp -d)" || {
+        log_error "Could not create a temporary directory for the git credential helper."
+        log_error "  The filesystem behind mktemp is full or not writable."
         exit 1
     }
     chmod 700 "$ASKPASS_DIR"
