@@ -129,6 +129,15 @@ check_root() {
         log_error "This script must be run as root"
         exit 1
     fi
+    # PIN HOME. Everything this script configures belongs to root, and
+    # `git config --global` resolves its file from $HOME with no opinion about
+    # who is running. `sudo` supplies HOME=/root, but the two invocations this
+    # script's own header recommends do not: `sudo -E` preserves the operator's
+    # HOME (root then writes the platform identity into /home/<operator>/.gitconfig
+    # and leaves it root-owned), and a systemd unit supplies no HOME at all
+    # (`fatal: $HOME not set`, Task 4 dies). Neither is hypothetical; both were
+    # measured. Pinning here covers every caller instead of one.
+    export HOME=/root
 }
 
 # Task 0: Create folder structure and user group
@@ -542,7 +551,10 @@ read_pat_from_cluster() {
 # Asks GitHub whether this token reaches one repository: 200 means yes, and a
 # repository the token does not cover answers 404 — a fine-grained PAT is
 # invisible to what it was not granted. Anything but 200 — expired, revoked,
-# awaiting org approval, wrong scope — means we need a new one.
+# awaiting org approval, repository not selected — means we need a new one.
+# It does NOT prove Contents:Read: this endpoint needs only Metadata, which every
+# fine-grained token carries, so a token missing Contents passes here and fails
+# at the clone. ensure_repo_cloned's error message says so.
 pat_reads_repo() {
     local -; set +x    # the token is in scope below; xtrace is a log
     local token="$1" repo="$2" code
@@ -637,7 +649,7 @@ resolve_pat() {
         [[ $rc -eq 3 ]] && { log_error "Fix /run on this host and re-run; the token was never judged."; exit 1; }
         [[ $rc -eq 2 ]] && { log_error "Fix the network (or wait for the API) and re-run; the token was never judged."; exit 1; }
         log_error "GITHUB_READ_PAT is set but GitHub refused it for the repositories above."
-        log_error "  Expired, revoked, awaiting org approval, or missing Contents:Read on one of them."
+        log_error "  Expired, revoked, awaiting org approval, or not granted one of them."
         exit 1
     fi
 
@@ -658,7 +670,16 @@ resolve_pat() {
     # script — a plain `read` would consume the next lines of this file and
     # execute nothing. /dev/tty is the operator's keyboard regardless of how
     # the script arrived.
-    if [[ ! -r /dev/tty ]]; then
+    # TESTED BY OPENING, NOT BY STAT. `[[ -r /dev/tty ]]` asks the filesystem
+    # about a character device that exists with mode 0666 on every Linux box —
+    # it passes with no controlling terminal, so this guard could not fire and
+    # the operator got a bare `/dev/tty: No such device or address` from the
+    # read below instead of the two lines under it. Opening is the
+    # condition that actually matters, and it is the one the read performs.
+    # GROUPED because redirections apply left to right: in `: < /dev/tty
+    # 2>/dev/null` the open fails before stderr is redirected, so bash printed
+    # the bare error anyway, directly above the guidance.
+    if ! { : < /dev/tty; } 2>/dev/null; then
         log_error "A token is needed and there is no terminal to ask on."
         log_error "  Re-run interactively, or set GITHUB_READ_PAT and use 'sudo -E'."
         exit 1
@@ -684,7 +705,7 @@ resolve_pat() {
         [[ $rc -eq 3 ]] && { log_error "The token you pasted was never judged — fix /run on this host and re-run."; exit 1; }
         [[ $rc -eq 2 ]] && { log_error "The token you pasted was never judged — fix the network and re-run."; exit 1; }
         log_error "GitHub refused that token for one of the two repositories."
-        log_error "  Check: org approval, Contents:Read, and that BOTH repositories are selected."
+        log_error "  Check: expiry, org approval, and that BOTH repositories are selected."
         exit 1
     }
     log_info "Token valid for ${SKYY_COMMAND_REPO_NAME} and ${COLLECTIONS_REPO_NAME}"
@@ -698,9 +719,17 @@ make_askpass() {
     # `set -e` is suppressed: an unchecked failure leaves ASKPASS_DIR empty, the
     # helper is written to `/askpass.sh` at the filesystem root, and cleanup's
     # `[[ -n "$ASKPASS_DIR" ]]` guard cannot remove what it cannot name.
-    ASKPASS_DIR="$(mktemp -d -p /run)" || {
-        log_error "Could not create a memory-backed directory under /run for the git credential helper."
-        log_error "  /run is full or not writable; the token must not fall back to disk."
+    # NOT UNDER /run, AND THE REASON IS THIS FUNCTION'S HEADER: the token's value is
+    # never in this file, only the name of an environment variable. So there is
+    # no secret here for a memory-backed filesystem to protect — and `/run` is
+    # mounted `noexec` on stock Ubuntu, while GIT_ASKPASS must point at
+    # something git can EXECUTE. Under `-p /run` every clone died with
+    # `fatal: cannot exec '/run/tmp.XXXX/askpass.sh': Permission denied`,
+    # measured on two machines. `image-manager/bootstrap.sh` has always used the
+    # default directory here and is the sibling that works.
+    ASKPASS_DIR="$(mktemp -d)" || {
+        log_error "Could not create a temporary directory for the git credential helper."
+        log_error "  The filesystem behind mktemp is full or not writable."
         exit 1
     }
     chmod 700 "$ASKPASS_DIR"
@@ -834,8 +863,13 @@ ensure_repo_cloned() {
 
     log_info "Cloning ${GITHUB_OWNER}/${repo} to $dir (this may take a moment)..."
     if ! git_with_token clone "$clean_url" "$dir"; then
-        log_error "Clone of ${GITHUB_OWNER}/${repo} failed despite a token that validated moments ago."
-        log_error "  Network, or the repository's default branch is not clonable."
+        log_error "Clone of ${GITHUB_OWNER}/${repo} failed. git's own error, directly above, is the diagnosis."
+        log_error "  The token check earlier this run proves only that the token can SEE ${repo}"
+        log_error "  (Metadata, which every token carries), not that it can read its code. If git's"
+        log_error "  error is a 403 or 'not found', the token lacks Contents: Read on ${repo}."
+        log_error "  Otherwise, causes this script cannot rule out: the git credential helper's temp"
+        log_error "  directory not executable (TMPDIR on a noexec mount), $(dirname "$dir") full,"
+        log_error "  or the network dropping mid-clone."
         return 1
     fi
     assert_remote_is_clean "$dir"
@@ -1042,10 +1076,8 @@ main() {
         log_info "[Task 5/6] ✓ Completed"
     else
         log_error "[Task 5/6] ✗ Failed"
-        log_error "Failed to clone the repositories"
-        log_error "Please verify:"
-        log_error "  - The READ token covers both repositories with Contents: Read"
-        log_error "  - Network connectivity is available"
+        log_error "Failed to clone or converge the repositories"
+        log_error "  The cause is the error printed above. Fix what it names, then re-run this installer."
         exit 1
     fi
     echo ""

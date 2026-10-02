@@ -118,6 +118,10 @@ check_root() {
         log_error "Run as root: curl -fsSL <url> | sudo bash"
         exit 1
     fi
+    # PIN HOME. `sudo -E` keeps the operator's HOME and systemd supplies none,
+    # while ensure_git's `git config --global` resolves its file from $HOME —
+    # so root would rewrite /home/<operator>/.gitconfig and leave it root-owned.
+    export HOME=/root
 }
 
 # ---------------------------------------------------------------------------
@@ -136,10 +140,13 @@ read_pat_from_cluster() {
         | base64 -d 2>/dev/null || true
 }
 
-# PRESENCE IS NOT VALIDITY. Asks GitHub whether this token can actually read the
+# PRESENCE IS NOT VALIDITY. Asks GitHub whether this token can see the
 # repository. 200 means yes. Anything else — expired, revoked, unapproved,
-# wrong scope — means we need a new one, and the operator finds out here rather
-# than three steps later.
+# repository not selected — means we need a new one, and the operator finds out
+# here rather than three steps later.
+# It does NOT prove Contents:Read: GET /repos/{owner}/{repo} needs only
+# Metadata, which every fine-grained token carries, so a token missing Contents
+# passes here and fails at the clone. The clone's error message says so.
 # A REFUSAL and a FAILURE TO ASK are different answers, and telling an operator
 # to re-mint a working credential because the VM's network is down is the worse
 # of the two mistakes. 0 = reachable, 1 = GitHub refused, 2 = transport (never
@@ -210,7 +217,7 @@ resolve_pat() {
         [[ $rc -eq 3 ]] && { log_error "Fix /run on this host and re-run; the token was never judged."; exit 1; }
         [[ $rc -eq 2 ]] && { log_error "Could not reach api.github.com (HTTP ${PROBE_HTTP_CODE:-000}) — a NETWORK or API-availability failure, not a verdict on the token."; log_error "  Fix the network (or wait for the API) and re-run."; exit 1; }
         log_error "IMAGE_MANAGER_PAT is set but cannot read ${REPO_OWNER}/${REPO_NAME}."
-        log_error "  Expired, revoked, awaiting org approval, or missing Contents:Read."
+        log_error "  Expired, revoked, awaiting org approval, or the repo is not selected on it."
         exit 1
     fi
 
@@ -231,7 +238,11 @@ resolve_pat() {
     # script — a plain `read` would consume the next lines of this file and
     # execute nothing. /dev/tty is the operator's keyboard regardless of how
     # the script arrived.
-    if [[ ! -r /dev/tty ]]; then
+    # TESTED BY OPENING, NOT BY STAT. `[[ -r /dev/tty ]]` passes with no
+    # controlling terminal (the device node is 0666 everywhere), so this guard
+    # could not fire. GROUPED so the failed open's own error is silenced too:
+    # redirections apply left to right.
+    if ! { : < /dev/tty; } 2>/dev/null; then
         log_error "A token is needed and there is no terminal to ask on."
         log_error "  Re-run interactively, or set IMAGE_MANAGER_PAT and use 'sudo -E'."
         exit 1
@@ -256,7 +267,7 @@ resolve_pat() {
         [[ $rc -eq 3 ]] && { log_error "The token you pasted was never judged — fix /run on this host and re-run."; exit 1; }
         [[ $rc -eq 2 ]] && { log_error "The token you pasted was never judged — could not reach api.github.com (HTTP ${PROBE_HTTP_CODE:-000}). Fix the network and re-run."; exit 1; }
         log_error "That token cannot read ${REPO_OWNER}/${REPO_NAME}."
-        log_error "  Check: org approval, Contents:Read, and that the repo is selected."
+        log_error "  Check: expiry, org approval, and that the repo is selected."
         exit 1
     }
     log_info "Token valid for ${REPO_OWNER}/${REPO_NAME}"
@@ -364,8 +375,15 @@ ensure_repo_cloned() {
         log_info "Cloning ${REPO_OWNER}/${REPO_NAME} (${REPO_REF})..."
         if ! git_with_token clone --branch "$REPO_REF" \
              "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "$REPO_DIR"; then
-            log_error "Clone failed despite a token that validated moments ago."
-            log_error "  Network, or the branch '${REPO_REF}' does not exist."
+            log_error "Clone failed. git's own error, directly above, is the diagnosis."
+            log_error "  The token check earlier this run proves only that the token can SEE the repository"
+            log_error "  (Metadata, which every token carries), not that it can read its code."
+            log_error "  'Remote branch ... not found': REPO_REF='${REPO_REF}' names no branch or tag on"
+            log_error "  ${REPO_NAME}. Fix REPO_REF and re-run; the token is not the cause."
+            log_error "  A 403, or 'repository ... not found': the token lacks Contents: Read on ${REPO_NAME}."
+            log_error "  Otherwise, causes this script cannot rule out: the git credential helper's"
+            log_error "  temp directory not executable (TMPDIR on a noexec mount), $(dirname "$REPO_DIR")"
+            log_error "  full, or the network dropping mid-clone."
             return 1
         fi
         assert_remote_is_clean
@@ -378,8 +396,22 @@ ensure_repo_cloned() {
     assert_remote_is_clean
 
     if ! git_with_token -C "$REPO_DIR" fetch --quiet origin "$REPO_REF"; then
-        log_warn "Could not reach the remote — continuing with the checkout as it stands"
-        return 0
+        # STOP, unlike the dirty-tree and diverged-HEAD branches below. Those
+        # continue because stopping would put local work at risk; stopping here
+        # destroys nothing, so "present is not current" governs: an unfetchable
+        # ref means currency cannot be verified, and stage 2 would install
+        # whatever is on disk, possibly from a different ref than the one asked for.
+        # Not necessarily the network: a REPO_REF naming no branch ("couldn't find
+        # remote ref") and a token without Contents: Read fail here too.
+        log_error "Fetch of '${REPO_REF}' failed; git's own error, directly above, names why."
+        log_error "  'couldn't find remote ref': REPO_REF='${REPO_REF}' names no branch or tag on"
+        log_error "  ${REPO_NAME}. Fix REPO_REF and re-run; the token is not the cause."
+        log_error "  A 403, or 'repository ... not found': the token lacks Contents: Read on ${REPO_NAME}."
+        log_error "  Otherwise, causes this script cannot rule out: the git credential helper's"
+        log_error "  temp directory not executable (TMPDIR on a noexec mount), or the network."
+        log_error "  Install stopped: the checkout at $REPO_DIR cannot be verified as current."
+        log_error "  Fix the cause above and re-run."
+        return 1
     fi
 
     local local_sha remote_sha
