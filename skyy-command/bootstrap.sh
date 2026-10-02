@@ -551,7 +551,10 @@ read_pat_from_cluster() {
 # Asks GitHub whether this token reaches one repository: 200 means yes, and a
 # repository the token does not cover answers 404 — a fine-grained PAT is
 # invisible to what it was not granted. Anything but 200 — expired, revoked,
-# awaiting org approval, wrong scope — means we need a new one.
+# awaiting org approval, repository not selected — means we need a new one.
+# It does NOT prove Contents:Read: this endpoint needs only Metadata, which every
+# fine-grained token carries, so a token missing Contents passes here and fails
+# at the clone. ensure_repo_cloned's error message says so.
 pat_reads_repo() {
     local -; set +x    # the token is in scope below; xtrace is a log
     local token="$1" repo="$2" code
@@ -646,7 +649,7 @@ resolve_pat() {
         [[ $rc -eq 3 ]] && { log_error "Fix /run on this host and re-run; the token was never judged."; exit 1; }
         [[ $rc -eq 2 ]] && { log_error "Fix the network (or wait for the API) and re-run; the token was never judged."; exit 1; }
         log_error "GITHUB_READ_PAT is set but GitHub refused it for the repositories above."
-        log_error "  Expired, revoked, awaiting org approval, or missing Contents:Read on one of them."
+        log_error "  Expired, revoked, awaiting org approval, or not granted one of them."
         exit 1
     fi
 
@@ -702,7 +705,7 @@ resolve_pat() {
         [[ $rc -eq 3 ]] && { log_error "The token you pasted was never judged — fix /run on this host and re-run."; exit 1; }
         [[ $rc -eq 2 ]] && { log_error "The token you pasted was never judged — fix the network and re-run."; exit 1; }
         log_error "GitHub refused that token for one of the two repositories."
-        log_error "  Check: org approval, Contents:Read, and that BOTH repositories are selected."
+        log_error "  Check: expiry, org approval, and that BOTH repositories are selected."
         exit 1
     }
     log_info "Token valid for ${SKYY_COMMAND_REPO_NAME} and ${COLLECTIONS_REPO_NAME}"
@@ -716,7 +719,7 @@ make_askpass() {
     # `set -e` is suppressed: an unchecked failure leaves ASKPASS_DIR empty, the
     # helper is written to `/askpass.sh` at the filesystem root, and cleanup's
     # `[[ -n "$ASKPASS_DIR" ]]` guard cannot remove what it cannot name.
-    # NOT UNDER /run, AND THE REASON IS THE LINE ABOVE: the token's value is
+    # NOT UNDER /run, AND THE REASON IS THIS FUNCTION'S HEADER: the token's value is
     # never in this file, only the name of an environment variable. So there is
     # no secret here for a memory-backed filesystem to protect — and `/run` is
     # mounted `noexec` on stock Ubuntu, while GIT_ASKPASS must point at
@@ -861,8 +864,10 @@ ensure_repo_cloned() {
     log_info "Cloning ${GITHUB_OWNER}/${repo} to $dir (this may take a moment)..."
     if ! git_with_token clone "$clean_url" "$dir"; then
         log_error "Clone of ${GITHUB_OWNER}/${repo} failed. git's own error, directly above, is the diagnosis."
-        log_error "  The token validated against GitHub this run, so its scope is not the cause."
-        log_error "  Local causes this script cannot rule out: the git credential helper's temp"
+        log_error "  The token check earlier this run proves only that the token can SEE ${repo}"
+        log_error "  (Metadata, which every token carries), not that it can read its code. If git's"
+        log_error "  error is a 403 or 'not found', the token lacks Contents: Read on ${repo}."
+        log_error "  Otherwise, causes this script cannot rule out: the git credential helper's temp"
         log_error "  directory not executable (TMPDIR on a noexec mount), $(dirname "$dir") full,"
         log_error "  or the network dropping mid-clone."
         return 1
@@ -1072,9 +1077,7 @@ main() {
     else
         log_error "[Task 5/6] ✗ Failed"
         log_error "Failed to clone or converge the repositories"
-        log_error "  The cause is the error printed above. Any token used was"
-        log_error "  validated against both repositories this run, so it is not the token."
-        log_error "  Fix what that error names, then re-run this installer."
+        log_error "  The cause is the error printed above. Fix what it names, then re-run this installer."
         exit 1
     fi
     echo ""

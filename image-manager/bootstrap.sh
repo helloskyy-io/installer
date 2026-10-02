@@ -140,10 +140,13 @@ read_pat_from_cluster() {
         | base64 -d 2>/dev/null || true
 }
 
-# PRESENCE IS NOT VALIDITY. Asks GitHub whether this token can actually read the
+# PRESENCE IS NOT VALIDITY. Asks GitHub whether this token can see the
 # repository. 200 means yes. Anything else — expired, revoked, unapproved,
-# wrong scope — means we need a new one, and the operator finds out here rather
-# than three steps later.
+# repository not selected — means we need a new one, and the operator finds out
+# here rather than three steps later.
+# It does NOT prove Contents:Read: GET /repos/{owner}/{repo} needs only
+# Metadata, which every fine-grained token carries, so a token missing Contents
+# passes here and fails at the clone. The clone's error message says so.
 # A REFUSAL and a FAILURE TO ASK are different answers, and telling an operator
 # to re-mint a working credential because the VM's network is down is the worse
 # of the two mistakes. 0 = reachable, 1 = GitHub refused, 2 = transport (never
@@ -214,7 +217,7 @@ resolve_pat() {
         [[ $rc -eq 3 ]] && { log_error "Fix /run on this host and re-run; the token was never judged."; exit 1; }
         [[ $rc -eq 2 ]] && { log_error "Could not reach api.github.com (HTTP ${PROBE_HTTP_CODE:-000}) — a NETWORK or API-availability failure, not a verdict on the token."; log_error "  Fix the network (or wait for the API) and re-run."; exit 1; }
         log_error "IMAGE_MANAGER_PAT is set but cannot read ${REPO_OWNER}/${REPO_NAME}."
-        log_error "  Expired, revoked, awaiting org approval, or missing Contents:Read."
+        log_error "  Expired, revoked, awaiting org approval, or the repo is not selected on it."
         exit 1
     fi
 
@@ -264,7 +267,7 @@ resolve_pat() {
         [[ $rc -eq 3 ]] && { log_error "The token you pasted was never judged — fix /run on this host and re-run."; exit 1; }
         [[ $rc -eq 2 ]] && { log_error "The token you pasted was never judged — could not reach api.github.com (HTTP ${PROBE_HTTP_CODE:-000}). Fix the network and re-run."; exit 1; }
         log_error "That token cannot read ${REPO_OWNER}/${REPO_NAME}."
-        log_error "  Check: org approval, Contents:Read, and that the repo is selected."
+        log_error "  Check: expiry, org approval, and that the repo is selected."
         exit 1
     }
     log_info "Token valid for ${REPO_OWNER}/${REPO_NAME}"
@@ -373,8 +376,10 @@ ensure_repo_cloned() {
         if ! git_with_token clone --branch "$REPO_REF" \
              "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "$REPO_DIR"; then
             log_error "Clone failed. git's own error, directly above, is the diagnosis."
-            log_error "  The token validated against ${REPO_OWNER}/${REPO_NAME} this run, so its scope is not the cause."
-            log_error "  Causes this script cannot rule out: the branch '${REPO_REF}' does not exist, the"
+            log_error "  The token check earlier this run proves only that the token can SEE the repository"
+            log_error "  (Metadata, which every token carries), not that it can read its code. If git's"
+            log_error "  error is a 403 or 'not found', the token lacks Contents: Read on ${REPO_NAME}."
+            log_error "  Otherwise, causes this script cannot rule out: the branch '${REPO_REF}' does not exist, the"
             log_error "  git credential helper's temp directory not executable (TMPDIR on a noexec"
             log_error "  mount), $(dirname "$REPO_DIR") full, or the network dropping mid-clone."
             return 1
