@@ -377,11 +377,13 @@ ensure_repo_cloned() {
              "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "$REPO_DIR"; then
             log_error "Clone failed. git's own error, directly above, is the diagnosis."
             log_error "  The token check earlier this run proves only that the token can SEE the repository"
-            log_error "  (Metadata, which every token carries), not that it can read its code. If git's"
-            log_error "  error is a 403 or 'not found', the token lacks Contents: Read on ${REPO_NAME}."
-            log_error "  Otherwise, causes this script cannot rule out: the branch '${REPO_REF}' does not exist, the"
-            log_error "  git credential helper's temp directory not executable (TMPDIR on a noexec"
-            log_error "  mount), $(dirname "$REPO_DIR") full, or the network dropping mid-clone."
+            log_error "  (Metadata, which every token carries), not that it can read its code."
+            log_error "  'Remote branch ... not found': REPO_REF='${REPO_REF}' names no branch or tag on"
+            log_error "  ${REPO_NAME}. Fix REPO_REF and re-run; the token is not the cause."
+            log_error "  A 403, or 'repository ... not found': the token lacks Contents: Read on ${REPO_NAME}."
+            log_error "  Otherwise, causes this script cannot rule out: the git credential helper's"
+            log_error "  temp directory not executable (TMPDIR on a noexec mount), $(dirname "$REPO_DIR")"
+            log_error "  full, or the network dropping mid-clone."
             return 1
         fi
         assert_remote_is_clean
@@ -394,7 +396,10 @@ ensure_repo_cloned() {
     assert_remote_is_clean
 
     if ! git_with_token -C "$REPO_DIR" fetch --quiet origin "$REPO_REF"; then
-        log_warn "Could not reach the remote — continuing with the checkout as it stands"
+        # Not necessarily the network: a REPO_REF naming no branch ("couldn't find
+        # remote ref") and a token without Contents: Read fail here too.
+        log_warn "Fetch of '${REPO_REF}' failed; git's own error, directly above, names why."
+        log_warn "  Continuing with the checkout as it stands, which may not be current."
         return 0
     fi
 
