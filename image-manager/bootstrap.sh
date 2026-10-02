@@ -118,6 +118,10 @@ check_root() {
         log_error "Run as root: curl -fsSL <url> | sudo bash"
         exit 1
     fi
+    # PIN HOME. `sudo -E` keeps the operator's HOME and systemd supplies none,
+    # while ensure_git's `git config --global` resolves its file from $HOME —
+    # so root would rewrite /home/<operator>/.gitconfig and leave it root-owned.
+    export HOME=/root
 }
 
 # ---------------------------------------------------------------------------
@@ -231,7 +235,11 @@ resolve_pat() {
     # script — a plain `read` would consume the next lines of this file and
     # execute nothing. /dev/tty is the operator's keyboard regardless of how
     # the script arrived.
-    if [[ ! -r /dev/tty ]]; then
+    # TESTED BY OPENING, NOT BY STAT. `[[ -r /dev/tty ]]` passes with no
+    # controlling terminal (the device node is 0666 everywhere), so this guard
+    # could not fire. GROUPED so the failed open's own error is silenced too:
+    # redirections apply left to right.
+    if ! { : < /dev/tty; } 2>/dev/null; then
         log_error "A token is needed and there is no terminal to ask on."
         log_error "  Re-run interactively, or set IMAGE_MANAGER_PAT and use 'sudo -E'."
         exit 1
@@ -364,8 +372,11 @@ ensure_repo_cloned() {
         log_info "Cloning ${REPO_OWNER}/${REPO_NAME} (${REPO_REF})..."
         if ! git_with_token clone --branch "$REPO_REF" \
              "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "$REPO_DIR"; then
-            log_error "Clone failed despite a token that validated moments ago."
-            log_error "  Network, or the branch '${REPO_REF}' does not exist."
+            log_error "Clone failed. git's own error, directly above, is the diagnosis."
+            log_error "  The token validated against ${REPO_OWNER}/${REPO_NAME} this run, so its scope is not the cause."
+            log_error "  Causes this script cannot rule out: the branch '${REPO_REF}' does not exist, the"
+            log_error "  git credential helper's temp directory not executable (TMPDIR on a noexec"
+            log_error "  mount), $(dirname "$REPO_DIR") full, or the network dropping mid-clone."
             return 1
         fi
         assert_remote_is_clean

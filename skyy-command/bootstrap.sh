@@ -671,9 +671,12 @@ resolve_pat() {
     # about a character device that exists with mode 0666 on every Linux box —
     # it passes with no controlling terminal, so this guard could not fire and
     # the operator got a bare `/dev/tty: No such device or address` from the
-    # read eleven lines below instead of the two lines under it. Opening is the
+    # read below instead of the two lines under it. Opening is the
     # condition that actually matters, and it is the one the read performs.
-    if ! : < /dev/tty 2>/dev/null; then
+    # GROUPED because redirections apply left to right: in `: < /dev/tty
+    # 2>/dev/null` the open fails before stderr is redirected, so bash printed
+    # the bare error anyway, directly above the guidance.
+    if ! { : < /dev/tty; } 2>/dev/null; then
         log_error "A token is needed and there is no terminal to ask on."
         log_error "  Re-run interactively, or set GITHUB_READ_PAT and use 'sudo -E'."
         exit 1
@@ -857,8 +860,11 @@ ensure_repo_cloned() {
 
     log_info "Cloning ${GITHUB_OWNER}/${repo} to $dir (this may take a moment)..."
     if ! git_with_token clone "$clean_url" "$dir"; then
-        log_error "Clone of ${GITHUB_OWNER}/${repo} failed despite a token that validated moments ago."
-        log_error "  Network, or the repository's default branch is not clonable."
+        log_error "Clone of ${GITHUB_OWNER}/${repo} failed. git's own error, directly above, is the diagnosis."
+        log_error "  The token validated against GitHub this run, so its scope is not the cause."
+        log_error "  Local causes this script cannot rule out: the git credential helper's temp"
+        log_error "  directory not executable (TMPDIR on a noexec mount), $(dirname "$dir") full,"
+        log_error "  or the network dropping mid-clone."
         return 1
     fi
     assert_remote_is_clean "$dir"
@@ -1065,10 +1071,10 @@ main() {
         log_info "[Task 5/6] ✓ Completed"
     else
         log_error "[Task 5/6] ✗ Failed"
-        log_error "Failed to clone the repositories"
-        log_error "Please verify:"
-        log_error "  - The READ token covers both repositories with Contents: Read"
-        log_error "  - Network connectivity is available"
+        log_error "Failed to clone or converge the repositories"
+        log_error "  The cause is the error printed above. Any token used was"
+        log_error "  validated against both repositories this run, so it is not the token."
+        log_error "  Fix what that error names, then re-run this installer."
         exit 1
     fi
     echo ""
