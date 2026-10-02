@@ -396,11 +396,22 @@ ensure_repo_cloned() {
     assert_remote_is_clean
 
     if ! git_with_token -C "$REPO_DIR" fetch --quiet origin "$REPO_REF"; then
+        # STOP, unlike the dirty-tree and diverged-HEAD branches below. Those
+        # continue because stopping would put local work at risk; stopping here
+        # destroys nothing, so "present is not current" governs: an unfetchable
+        # ref means currency cannot be verified, and stage 2 would install
+        # whatever is on disk, possibly from a different ref than the one asked for.
         # Not necessarily the network: a REPO_REF naming no branch ("couldn't find
         # remote ref") and a token without Contents: Read fail here too.
-        log_warn "Fetch of '${REPO_REF}' failed; git's own error, directly above, names why."
-        log_warn "  Continuing with the checkout as it stands, which may not be current."
-        return 0
+        log_error "Fetch of '${REPO_REF}' failed; git's own error, directly above, names why."
+        log_error "  'couldn't find remote ref': REPO_REF='${REPO_REF}' names no branch or tag on"
+        log_error "  ${REPO_NAME}. Fix REPO_REF and re-run; the token is not the cause."
+        log_error "  A 403, or 'repository ... not found': the token lacks Contents: Read on ${REPO_NAME}."
+        log_error "  Otherwise, causes this script cannot rule out: the git credential helper's"
+        log_error "  temp directory not executable (TMPDIR on a noexec mount), or the network."
+        log_error "  Install stopped: the checkout at $REPO_DIR cannot be verified as current."
+        log_error "  Fix the cause above and re-run."
+        return 1
     fi
 
     local local_sha remote_sha
