@@ -162,7 +162,8 @@ apt_get() {
             return "$rc"
         fi
         log_info "Waiting for ${holder:-another apt/dpkg process} to release ${lock:-the apt lock} ($((SECONDS - started))s of ${APT_LOCK_TIMEOUT}s)..." >&2
-        sleep "$APT_LOCK_POLL_SECONDS"
+        # Never sleep past the deadline, so the bound the messages state is the bound kept.
+        sleep "$(( deadline - SECONDS < APT_LOCK_POLL_SECONDS ? deadline - SECONDS : APT_LOCK_POLL_SECONDS ))"
     done
 }
 

@@ -100,7 +100,9 @@ fi
 # is how skyy-command's main calls its tasks, so an unchecked `apt_get update`
 # that gave up on the lock ran straight into a second full wait. A call is
 # checked when its statement is an `if`/`while`/`until` condition, or when it is
-# a `&&` chain of apt_get calls (optionally `{ …; }`-grouped) ending in `||`.
+# a `&&` chain of apt_get calls (optionally `{ …; }`-grouped) ending in
+# `|| return`, `|| exit` or `|| {` — `|| true` swallows the status and fails. An
+# `if` whose apt_get sits in the `then` body, not the condition, fails too.
 # Backslash continuations are joined first, so a multi-line install counts as
 # one statement. Zero calls found FAILS — a guard over nothing passes forever.
 apt_calls=0
@@ -114,8 +116,8 @@ for f in skyy-command/bootstrap.sh image-manager/bootstrap.sh; do
             if (s ~ /^#/ || s !~ /(^|[^_a-zA-Z])apt_get[ \t]/) next
             gsub(/[0-9]*>&[0-9]+/, "", s)
             print "CALL"
-            if (s ~ /^(if|elif|while|until)[ \t]/) next
-            if (s ~ /^(\{[ \t]+)?apt_get[ \t][^;&|]*([ \t]*&&[ \t]*apt_get[ \t][^;&|]*)*(;[ \t]*\})?[ \t]*\|\|/) next
+            if (s ~ /^(if|elif|while|until)[ \t]/ && s !~ /;[ \t]*(then|do)[ \t].*apt_get[ \t]/) next
+            if (s ~ /^(\{[ \t]+)?apt_get[ \t][^;&|]*([ \t]*&&[ \t]*apt_get[ \t][^;&|]*)*(;[ \t]*\})?[ \t]*\|\|[ \t]*(return|exit|\{)/ && s !~ /\|\|.*apt_get[ \t]/) next
             print "UNCHECKED " FILENAME ":" NR ": " s
         }' "${f}")"
     apt_calls=$((apt_calls + $(grep -c '^CALL' <<<"${report}" || true)))
@@ -125,6 +127,14 @@ for f in skyy-command/bootstrap.sh image-manager/bootstrap.sh; do
         apt_unchecked=$((apt_unchecked + 1))
     done < <(grep '^UNCHECKED' <<<"${report}" || true)
 done
+# Nothing but the wrapper may call apt directly: a raw apt-get skips the lock
+# wait and this guard alike. The wrapper's own call is the one allowed line.
+raw_apt="$(grep -nE '(^|[;&|({]|=[^ ]*)[[:space:]]*(sudo[[:space:]]+)?apt(-get)?[[:space:]]' skyy-command/bootstrap.sh image-manager/bootstrap.sh | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#|LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get' || true)"
+if [[ -n "${raw_apt}" ]]; then
+    echo "FAIL raw apt call outside apt_get:"
+    echo "       ${raw_apt//$'\n'/$'\n       '}"
+    FAILED=$((FAILED + 1))
+fi
 if [[ ${apt_calls} -eq 0 ]]; then
     echo "FAIL apt_get status check: found no apt_get call statements — the guard is reading nothing"
     FAILED=$((FAILED + 1))
