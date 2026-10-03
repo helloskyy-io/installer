@@ -105,10 +105,11 @@ fi
 # `if` whose apt_get sits in the `then` body, not the condition, fails too.
 # Backslash continuations are joined first, so a multi-line install counts as
 # one statement. Zero calls found FAILS — a guard over nothing passes forever.
-apt_calls=0
-apt_unchecked=0
-for f in skyy-command/bootstrap.sh image-manager/bootstrap.sh; do
-    report="$(awk '
+# The two guards are functions, not inline loops, so the fixture self-test below
+# runs the SAME code the real files are judged by. A guard nothing exercises
+# can be edited into permanent silence and the suite stays green.
+apt_status_report() {
+    awk '
         { line = held $0; held = "" }
         /\\$/ { held = substr(line, 1, length(line) - 1) " "; next }
         {
@@ -119,20 +120,127 @@ for f in skyy-command/bootstrap.sh image-manager/bootstrap.sh; do
             if (s ~ /^(if|elif|while|until)[ \t]/ && s !~ /;[ \t]*(then|do)[ \t].*apt_get[ \t]/) next
             if (s ~ /^(\{[ \t]+)?apt_get[ \t][^;&|]*([ \t]*&&[ \t]*apt_get[ \t][^;&|]*)*(;[ \t]*\})?[ \t]*\|\|[ \t]*(return|exit|\{)/ && s !~ /\|\|.*apt_get[ \t]/) next
             print "UNCHECKED " FILENAME ":" NR ": " s
-        }' "${f}")"
+        }' "$1"
+}
+
+# Nothing but the wrapper may call apt directly: a raw apt-get skips the lock
+# wait and the status guard alike. `apt`/`apt-get` is flagged as a command word
+# ANYWHERE on a non-comment line — after `if`, `then`, `timeout N`, `command`,
+# `sudo`, `$(`, or behind an absolute path — not only at line start. Quoted
+# text is dropped first (log messages say "the apt lock"), EXCEPT a double-
+# quoted string holding `$(` or a backtick, which can run a command. The one
+# exemption is the wrapper's own invocation, and only inside the apt_get()
+# body: the same text anywhere else is still a raw call.
+raw_apt_report() {
+    awk '
+        function strip(s,    out, seg) {
+            out = ""
+            while (match(s, /"[^"]*"/)) {
+                seg = substr(s, RSTART, RLENGTH)
+                if (seg !~ /\$\(([^(]|$)|`/) seg = ""
+                out = out substr(s, 1, RSTART - 1) seg
+                s = substr(s, RSTART + RLENGTH)
+            }
+            s = out s
+            gsub(/\047[^\047]*\047/, "", s)
+            sub(/[ \t]#.*/, "", s)
+            return s
+        }
+        BEGIN { lit = "LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get \"$@\"" }
+        /^apt_get\(\)[ \t]*\{/ { inwrap = 1 }
+        {
+            s = $0; sub(/^[ \t]+/, "", s)
+            if (s !~ /^#/) {
+                if (inwrap && (p = index(s, lit)) > 0) s = substr(s, 1, p - 1) substr(s, p + length(lit))
+                if (strip(s) ~ /(^|[^A-Za-z0-9_.-])(\/[^ \t]*\/)?apt(-get)?([ \t]|$)/)
+                    print "RAW " FILENAME ":" NR ": " $0
+            }
+            if ($0 ~ /^}/) inwrap = 0
+        }' "$1"
+}
+
+# Fixture self-test: each line is `guard|expectation|text` (`\n` = newline in
+# the text). `flag` fixtures MUST be reported, `pass` fixtures MUST NOT be. A
+# guard edited into silence fails the `flag` rows; one edited into flagging
+# everything fails the `pass` rows.
+selftest_apt_guards() {
+    local fixture guard expect text file out rc=0 fixtures=0
+    file="$(mktemp)"
+    while IFS= read -r fixture; do
+        [[ -n "${fixture}" ]] || continue
+        guard="${fixture%%|*}"; fixture="${fixture#*|}"
+        expect="${fixture%%|*}"; text="${fixture#*|}"
+        printf '%b\n' "${text}" >"${file}"
+        if [[ "${guard}" == status ]]; then
+            out="$(apt_status_report "${file}" | grep '^UNCHECKED' || true)"
+        else
+            out="$(raw_apt_report "${file}")"
+        fi
+        fixtures=$((fixtures + 1))
+        if [[ "${expect}" == flag && -z "${out}" ]]; then
+            echo "FAIL apt guard self-test: ${guard} guard did NOT flag: ${text}"
+            rc=1
+        elif [[ "${expect}" == pass && -n "${out}" ]]; then
+            echo "FAIL apt guard self-test: ${guard} guard wrongly flagged: ${text}"
+            rc=1
+        fi
+    done <<'FIXTURES'
+raw|flag|if apt-get update -qq; then :; fi
+raw|flag|if ! apt-get update; then
+raw|flag|    then apt-get update
+raw|flag|timeout 60 apt-get update
+raw|flag|command apt-get update
+raw|flag|/usr/bin/apt-get install x
+raw|flag|sudo apt install x
+raw|flag|x=$(apt-get update)
+raw|flag|echo "$(apt-get update)"
+raw|flag|LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get "$@" </dev/null
+raw|flag|apt_get() {\n    LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get "$@" || rc=$?; apt-get update\n}
+raw|pass|apt_get() {\n    LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get "$@" </dev/null || rc=$?\n}
+raw|pass|log_info "waiting for the apt lock (${holder:-another apt/dpkg process})"
+raw|pass|# apt-get is raw here
+raw|pass|echo done # apt-get note
+raw|pass|systemctl is-active apt-daily.timer
+raw|pass|apt_get update || return 1
+status|flag|apt_get update
+status|flag|apt_get update || true
+status|flag|if x; then apt_get update; fi
+status|pass|apt_get update || return 1
+status|pass|{ apt_get update && apt_get install -y acl; } || { log_error x; return 1; }
+status|pass|if ! apt_get update; then
+FIXTURES
+    rm -f "${file}"
+    if [[ ${rc} -eq 0 ]]; then
+        echo "PASS apt guard self-test (${fixtures} fixtures)"
+    else
+        FAILED=$((FAILED + 1))
+    fi
+}
+selftest_apt_guards
+
+# Both guards run over every shell script the suite lints, except testing/ —
+# this runner holds the guards' own fixtures, which are apt calls by design. A
+# new installer script that calls apt directly is judged without being listed.
+apt_calls=0
+apt_unchecked=0
+raw_found=0
+for script in "${SCRIPTS[@]}"; do
+    f="${script#./}"
+    [[ "${f}" == testing/* ]] && continue
+    report="$(apt_status_report "${f}")"
     apt_calls=$((apt_calls + $(grep -c '^CALL' <<<"${report}" || true)))
     while IFS= read -r u; do
         [[ -n "${u}" ]] || continue
         echo "FAIL apt_get status unchecked: ${u#UNCHECKED }"
         apt_unchecked=$((apt_unchecked + 1))
     done < <(grep '^UNCHECKED' <<<"${report}" || true)
+    while IFS= read -r r; do
+        [[ -n "${r}" ]] || continue
+        echo "FAIL raw apt call outside apt_get: ${r#RAW }"
+        raw_found=$((raw_found + 1))
+    done < <(raw_apt_report "${f}")
 done
-# Nothing but the wrapper may call apt directly: a raw apt-get skips the lock
-# wait and this guard alike. The wrapper's own call is the one allowed line.
-raw_apt="$(grep -nE '(^|[;&|({]|=[^ ]*)[[:space:]]*(sudo[[:space:]]+)?apt(-get)?[[:space:]]' skyy-command/bootstrap.sh image-manager/bootstrap.sh | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#|LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get' || true)"
-if [[ -n "${raw_apt}" ]]; then
-    echo "FAIL raw apt call outside apt_get:"
-    echo "       ${raw_apt//$'\n'/$'\n       '}"
+if [[ ${raw_found} -gt 0 ]]; then
     FAILED=$((FAILED + 1))
 fi
 if [[ ${apt_calls} -eq 0 ]]; then
