@@ -94,6 +94,45 @@ elif [[ "${sc_block}" != "${im_block}" ]]; then
 else
     echo "PASS apt_get copies identical (skyy-command, image-manager)"
 fi
+
+# Every apt_get call must CHECK the status it returns. `set -e` is no substitute:
+# it is off for the whole body of a function called as an `if` condition, which
+# is how skyy-command's main calls its tasks, so an unchecked `apt_get update`
+# that gave up on the lock ran straight into a second full wait. A call is
+# checked when its statement is an `if`/`while`/`until` condition, or when it is
+# a `&&` chain of apt_get calls (optionally `{ …; }`-grouped) ending in `||`.
+# Backslash continuations are joined first, so a multi-line install counts as
+# one statement. Zero calls found FAILS — a guard over nothing passes forever.
+apt_calls=0
+apt_unchecked=0
+for f in skyy-command/bootstrap.sh image-manager/bootstrap.sh; do
+    report="$(awk '
+        { line = held $0; held = "" }
+        /\\$/ { held = substr(line, 1, length(line) - 1) " "; next }
+        {
+            s = line; sub(/^[ \t]+/, "", s)
+            if (s ~ /^#/ || s !~ /(^|[^_a-zA-Z])apt_get[ \t]/) next
+            gsub(/[0-9]*>&[0-9]+/, "", s)
+            print "CALL"
+            if (s ~ /^(if|elif|while|until)[ \t]/) next
+            if (s ~ /^(\{[ \t]+)?apt_get[ \t][^;&|]*([ \t]*&&[ \t]*apt_get[ \t][^;&|]*)*(;[ \t]*\})?[ \t]*\|\|/) next
+            print "UNCHECKED " FILENAME ":" NR ": " s
+        }' "${f}")"
+    apt_calls=$((apt_calls + $(grep -c '^CALL' <<<"${report}" || true)))
+    while IFS= read -r u; do
+        [[ -n "${u}" ]] || continue
+        echo "FAIL apt_get status unchecked: ${u#UNCHECKED }"
+        apt_unchecked=$((apt_unchecked + 1))
+    done < <(grep '^UNCHECKED' <<<"${report}" || true)
+done
+if [[ ${apt_calls} -eq 0 ]]; then
+    echo "FAIL apt_get status check: found no apt_get call statements — the guard is reading nothing"
+    FAILED=$((FAILED + 1))
+elif [[ ${apt_unchecked} -gt 0 ]]; then
+    FAILED=$((FAILED + 1))
+else
+    echo "PASS apt_get status checked at every call (${apt_calls} statement(s))"
+fi
 for script in "${SCRIPTS[@]}"; do
     rel="${script#./}"
     # Each control is measured on its own, so a report names WHICH one failed.
