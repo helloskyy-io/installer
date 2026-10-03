@@ -25,7 +25,20 @@ blocking:
   - tests                 # .github/workflows/tests.yml — testing/run-all.sh:
                           # bash -n + shellcheck over every shell file in the tree
 
-# No advisory checks. Nothing runs on PRs here that reports tooling health
-# rather than a finding about the installer. An entry added later MUST name
-# what is consequently not covered.
-advisory: []
+# An entry MUST name what is consequently not covered.
+advisory:
+  - name: CodeQL
+    reason: >-
+      GitHub CodeQL default setup, configured in the repo settings and not by
+      any file here; it reports on PRs as this summary check and as one
+      `Analyze (<language>)` job per language it detects. Its status is the
+      scan's JOB status, so red means the scan did not COMPLETE, not that it
+      found something — gating on it would let GitHub's scanner breaking halt
+      this repo's merges. Same ruling as claude-dot-files' check-policy.yaml.
+      NOT COVERED: a PR whose scan failed merges unscanned; default setup's
+      scan of the default branch catches it after the fact.
+  - name: Analyze (actions)
+    reason: >-
+      CodeQL default setup's job for the `actions` language — it scans
+      .github/workflows/, not the installer scripts. Same reasoning and same
+      uncovered class as CodeQL above. First observed undeclared on PR #9.

@@ -91,6 +91,82 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# A HELD APT LOCK IS TRANSIENT, NOT FATAL. Ubuntu starts apt-daily and
+# unattended-upgrades by itself on boot, so the documented flow — create a VM,
+# run the one-liner — races them, and a prompt operator loses: `apt-get` exits
+# 100 with "Could not get lock". Every apt call in this script goes through
+# apt_get, which waits (bounded) for the holder to finish and retries.
+#
+# ONLY a lock contention retries. apt exits 100 for EVERY failure — a missing
+# package, a dead mirror, DNS — so the exit code cannot tell them apart; the
+# message can — and only a message showing CONTENTION counts ("It is held by
+# process", or apt's "(11: Resource temporarily unavailable)" when it cannot name
+# the holder): a permanent "Could not get lock … (13: Permission denied)" must
+# not wait out the timeout. Anything else returns at once with apt's own output intact,
+# because blanket-retrying would turn a real failure into a slow one.
+# LC_ALL=C pins that message to English: apt's errors are translated, and the
+# operator's locale rides in through sudo.
+#
+# Its own messages go to stderr, so a caller that silences apt's stdout still
+# shows the wait: an operator watching a silent wait cannot tell it from a hang.
+#
+# apt's stdin is /dev/null and its frontend is noninteractive. The documented
+# run is `curl … | sudo bash`, so bash's stdin IS the rest of this script: an
+# apt, dpkg or debconf prompt that reads it consumes unexecuted script text as
+# its answer, and bash then runs whatever is left out of alignment.
+#
+# IT RETURNS A STATUS AND NEVER EXITS, AND EVERY CALLER MUST CHECK THAT STATUS
+# EXPLICITLY (`|| return 1`, or inside an `if`). `set -e` cannot be relied on to
+# stop a caller: it is switched off for the whole body of any function called
+# as an `if`/`&&`/`||` condition, so the same unchecked call stops the script
+# at one call site and carries on into a second full wait at another.
+# testing/run-all.sh fails any unchecked call.
+#
+# The lock is waited on, never broken: unattended-upgrades is a security
+# mechanism, and terminating it on the operator's machine is not ours to do.
+#
+# Duplicated verbatim in image-manager/bootstrap.sh, deliberately: each installer is
+# fetched alone by curl, so neither can source the other.
+#
+# Seconds, overridable for a slow first boot. A fresh image months behind on
+# security updates can keep unattended-upgrades busy for several minutes.
+APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT:-600}"
+APT_LOCK_POLL_SECONDS=10
+
+apt_get() {
+    local err_file rc lock holder
+    # Validated before the arithmetic below, which would read a non-number as a
+    # variable name.
+    # A leading zero is refused too: bash arithmetic reads 08 as octal and
+    # aborts the script instead of returning.
+    [[ "$APT_LOCK_TIMEOUT" =~ ^(0|[1-9][0-9]*)$ ]] || { log_error "APT_LOCK_TIMEOUT must be a whole number of seconds, got '$APT_LOCK_TIMEOUT'" >&2; return 1; }
+    local deadline=$((SECONDS + APT_LOCK_TIMEOUT))
+    local started=$SECONDS
+    err_file="$(mktemp)" || { log_error "apt_get: could not create a temp file" >&2; return 1; }
+    while true; do
+        rc=0
+        LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get "$@" </dev/null 2>"$err_file" || rc=$?
+        if [[ $rc -eq 0 ]] || ! grep -Eq '^E: Could not get lock .*(It is held by process|\(11: Resource temporarily unavailable\))' "$err_file"; then
+            cat "$err_file" >&2
+            rm -f "$err_file"
+            return "$rc"
+        fi
+        # "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 1206 (unattended-upgr)"
+        lock="$(sed -n 's/^E: Could not get lock \(\/[^ ]*\)\. .*/\1/p;T;q' "$err_file")"
+        holder="$(sed -n 's/.*It is held by process \([0-9]*\) (\(.*\))$/\2 (pid \1)/p;T;q' "$err_file")"
+        if (( SECONDS >= deadline )); then
+            cat "$err_file" >&2
+            rm -f "$err_file"
+            log_error "Gave up after ${APT_LOCK_TIMEOUT}s waiting for ${holder:-another apt/dpkg process} to release ${lock:-the apt lock}" >&2
+            log_error "Re-run once it finishes, or allow longer: curl … | sudo APT_LOCK_TIMEOUT=<seconds> bash" >&2
+            return "$rc"
+        fi
+        log_info "Waiting for ${holder:-another apt/dpkg process} to release ${lock:-the apt lock} ($((SECONDS - started))s of ${APT_LOCK_TIMEOUT}s)..." >&2
+        # Never sleep past the deadline, so the bound the messages state is the bound kept.
+        sleep "$(( deadline - SECONDS < APT_LOCK_POLL_SECONDS ? deadline - SECONDS : APT_LOCK_POLL_SECONDS ))"
+    done
+}
+
 # XTRACE IS A LOG, AND THE TOKEN MAY NOT REACH IT. An operator debugging a
 # failed standup runs `curl … | sudo bash -x`, and `set -x` prints every
 # expansion — including the token in `pat_reads_repo`'s argv, in `local token=`,
@@ -149,8 +225,7 @@ setup_folder_and_group() {
     # Ubuntu Server by default despite being a POSIX-standard tool.
     if ! command -v setfacl >/dev/null 2>&1; then
         log_info "Installing 'acl' package (provides setfacl for POSIX ACLs)..."
-        apt-get update -qq
-        apt-get install -y acl || {
+        { apt_get update -qq && apt_get install -y acl; } || {
             log_error "Failed to install 'acl' package"
             return 1
         }
@@ -309,14 +384,15 @@ install_docker() {
         log_info "Installing Docker using official repository method..."
         
         # Update package index
-        apt-get update
+        apt_get update || return 1
         
         # Install prerequisites
-        apt-get install -y \
+        apt_get install -y \
             ca-certificates \
             curl \
             gnupg \
-            lsb-release
+            lsb-release \
+            || return 1
         
         # Add Docker's official GPG key (modern method, avoids legacy key issues)
         install -m 0755 -d /etc/apt/keyrings
@@ -333,15 +409,16 @@ install_docker() {
           tee /etc/apt/sources.list.d/docker.list > /dev/null
         
         # Update package index with Docker repository
-        apt-get update
+        apt_get update || return 1
         
         # Install Docker Engine, CLI, and containerd
-        apt-get install -y \
+        apt_get install -y \
             docker-ce \
             docker-ce-cli \
             containerd.io \
             docker-buildx-plugin \
-            docker-compose-plugin
+            docker-compose-plugin \
+            || return 1
         
         # Enable and start Docker service
         systemctl enable docker
@@ -361,8 +438,10 @@ install_docker() {
         log_info "Docker Compose is already available: $(docker compose version)"
     else
         log_warn "Docker Compose plugin not found, attempting to install..."
-        apt-get update
-        apt-get install -y docker-compose-plugin
+        { apt_get update && apt_get install -y docker-compose-plugin; } || {
+            log_error "Docker Compose plugin install failed"
+            return 1
+        }
 
         if docker compose version &> /dev/null; then
             log_info "Docker Compose installed successfully: $(docker compose version)"
@@ -472,8 +551,8 @@ install_git() {
         log_info "Git is already installed: $(git --version)"
     else
         log_info "Installing git..."
-        apt-get update
-        apt-get install -y git
+        apt_get update || return 1
+        apt_get install -y git || return 1
         log_info "Git installed successfully"
     fi
     
@@ -985,9 +1064,9 @@ ensure_qemu_guest_agent() {
         log_info "qemu-guest-agent already installed"
     else
         log_info "Installing qemu-guest-agent (hypervisor integration + backup fs-freeze)..."
-        apt-get update -qq
-        apt-get install -y qemu-guest-agent \
-            || log_warn "qemu-guest-agent install failed (non-fatal; set --agent 1 at VM create + reinstall)"
+        if ! { apt_get update -qq && apt_get install -y qemu-guest-agent; }; then
+            log_warn "qemu-guest-agent install failed (non-fatal; set --agent 1 at VM create + reinstall)"
+        fi
     fi
 }
 

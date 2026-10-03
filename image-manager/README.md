@@ -169,6 +169,26 @@ For an unattended re-run, `IMAGE_MANAGER_PAT` in the environment short-circuits 
 the check — and then `sudo -E` is required so the variable survives. **Prefer the prompt when a
 human is present: an exported secret is a secret in your shell history.**
 
+### On a freshly booted VM it may wait for apt first
+
+Ubuntu runs `apt-daily` and `unattended-upgrades` by itself shortly after boot, and while they hold
+the apt/dpkg lock no other install can run. The installer waits for them rather than failing,
+printing a line every 10 seconds:
+
+```
+[INFO] Waiting for unattended-upgr (pid 1206) to release /var/lib/dpkg/lock-frontend (40s of 600s)...
+```
+
+This is expected. **Do not kill `unattended-upgrades` to hurry it** — it is applying security
+updates. The wait is bounded by `APT_LOCK_TIMEOUT` (seconds, default `600`); past it the installer
+stops with an error and is safe to re-run. To allow longer, pass the variable **to `sudo`, not to
+`curl`** — `sudo` drops the caller's environment, so a variable set before `curl` never reaches the
+script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/helloskyy-io/installer/main/image-manager/bootstrap.sh | sudo APT_LOCK_TIMEOUT=1200 bash
+```
+
 ### What it does
 
 | # | Step |
