@@ -8,11 +8,21 @@
 # remembering to run one, which the Testing Standard § "Why local-only
 # enforcement does not satisfy this" calls a convention rather than a control.
 #
-# Two controls, both over EVERY shell file discovered in the tree:
+# Two per-file controls, over EVERY shell file discovered in the tree:
 #   - `bash -n`    — the file parses. A syntax error in a bootstrap script is
 #                    discovered by the operator, on the VM, halfway through.
 #   - `shellcheck` — the defect classes a parse cannot see: unquoted expansions,
 #                    masked exit statuses (SC2155), unreachable conditions.
+#
+# Four guard checks on the apt/dpkg lock handling, which is what a fresh VM's
+# first boot races (apt-daily / unattended-upgrades hold the lock). The list of
+# lock-taking commands is kept in one place, the comment on raw_apt_report:
+#   - drift check       — the two verbatim `apt_get` copies are identical.
+#   - status guard      — every `apt_get` call checks the status it returns.
+#   - raw-lock guard    — nothing but the wrapper takes the lock directly,
+#                         because a raw call waits for nothing.
+#   - guard self-test   — fixtures the two guards must flag or pass, so a guard
+#                         edited into silence fails.
 #
 # DISCOVERY IS THE WHOLE TREE and the trigger must not be narrower (Testing
 # Standard § "A gate's trigger MUST NOT be narrower than its runner's
@@ -22,8 +32,10 @@
 # indistinguishable from one that checked everything and found it clean, which
 # is the "gate that skips a tier MUST fail loudly" clause.
 #
-# Exit 0 = every discovered file passed both controls; 1 = at least one failed,
-# or the tree/toolchain was not in a state where the controls could run.
+# Exit 0 = every discovered file passed both per-file controls AND every guard
+# check passed; 1 = at least one of either failed, or the tree/toolchain was not
+# in a state where the controls could run. The last line counts guard failures
+# and file failures separately, so it says which kind a red run was.
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -71,7 +83,8 @@ fi
 echo "installer test run — ${#SCRIPTS[@]} shell file(s) discovered"
 echo "-----------------------------------------------------------------"
 
-FAILED=0
+GUARD_FAILED=0
+FILE_FAILED=0
 
 # `apt_get` is copied word for word into both installers, because each is
 # fetched alone by curl and neither can source the other. A copy nothing
@@ -86,11 +99,11 @@ sc_block="$(extract_apt_block skyy-command/bootstrap.sh)"
 im_block="$(extract_apt_block image-manager/bootstrap.sh)"
 if [[ -z "${sc_block}" || -z "${im_block}" ]]; then
     echo "FAIL apt_get drift check: could not extract the apt_get block from both bootstrap.sh files"
-    FAILED=$((FAILED + 1))
+    GUARD_FAILED=$((GUARD_FAILED + 1))
 elif [[ "${sc_block}" != "${im_block}" ]]; then
     echo "FAIL apt_get drift check: the copies in skyy-command/ and image-manager/ bootstrap.sh differ"
     diff <(echo "${sc_block}") <(echo "${im_block}") | sed 's/^/       /' || true
-    FAILED=$((FAILED + 1))
+    GUARD_FAILED=$((GUARD_FAILED + 1))
 else
     echo "PASS apt_get copies identical (skyy-command, image-manager)"
 fi
@@ -123,8 +136,15 @@ apt_status_report() {
         }' "$1"
 }
 
-# Nothing but the wrapper may call apt directly: a raw apt-get skips the lock
-# wait and the status guard alike. `apt`/`apt-get` is flagged as a command word
+# Nothing but the wrapper may take the apt/dpkg lock directly: a raw call skips
+# the lock wait and the status guard alike. THE LIST OF LOCK-TAKERS LIVES HERE
+# and nowhere else: `apt`, `apt-get`, `aptitude`, `dpkg-reconfigure` always;
+# `add-apt-repository` / `apt-add-repository` unless given `-n`/`--no-update`
+# (or if given `-u`/`--update`, which updates anyway); `dpkg` unless its
+# arguments contain a read-only action (--print-architecture, -s, -l, -L, -S,
+# -p, --get-selections, --compare-versions, --version, --help, --assert-*), so
+# `dpkg "$@"`, a bundled `-iE`, or an unlisted mutating action is flagged.
+# Limit: a lock-taking command not named here is not flagged. `apt`/`apt-get` is flagged as a command word
 # ANYWHERE on a non-comment line — after `if`, `then`, `timeout N`, `command`,
 # `sudo`, `$(`, or behind an absolute path — not only at line start. Quoted
 # text is dropped ONLY on a log line (`log_*`, `echo`, `printf` — their
@@ -151,14 +171,46 @@ raw_apt_report() {
             sub(/[ \t]#.*/, "", s)
             return s
         }
+        # A command that takes the lock only for some arguments. Every use of
+        # `cmd` is flagged unless its arguments (up to the next `;`/`&`/`|`)
+        # match `safe`, or when they match `bad`. An allowlist, so an argument
+        # nobody listed (`"$@"`, a variable, a bundled flag) is flagged rather
+        # than passed. Quotes, redirections and a trailing comment are removed
+        # from the arguments first, so none of them can hide or fake a token.
+        function lock_taker_by_args(t, cmd, safe, bad,    rest, seg) {
+            rest = t
+            while (match(rest, "(^|[^A-Za-z0-9_.-])(/[^ \t]*/)?(" cmd ")([^A-Za-z0-9_.\\/-]|$)")) {
+                rest = substr(rest, RSTART + RLENGTH - 1)
+                seg = rest
+                gsub(/[0-9]*>&[0-9]+/, "", seg)
+                gsub(/&>>?/, ">", seg)
+                gsub(/["\047]/, "", seg)
+                sub(/[ \t]#.*/, "", seg)
+                sub(/[;&|].*/, "", seg)
+                if (seg !~ safe || (bad != "" && seg ~ bad)) return 1
+            }
+            return 0
+        }
+        BEGIN { dpkg_ro = "(^|[ \t])(--print-architecture|--print-foreign-architectures|-s|--status|-l|--list|-L|--listfiles|-S|--search|-p|--print-avail|--get-selections|--compare-versions|--version|--help|--assert-[a-z-]+)([ \t=)`]|$)" }
         BEGIN { lit = "LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get \"$@\"" }
+        # Backslash continuations are joined first, as apt_status_report does, so
+        # a flag on the next line is seen as an argument of its command.
+        { line = held $0; held = "" }
+        /\\$/ { held = substr(line, 1, length(line) - 1) " "; next }
+        { $0 = line }
         /^apt_get\(\)[ \t]*\{/ { inwrap = 1 }
         {
             s = $0; sub(/^[ \t]+/, "", s)
             if (s !~ /^#/) {
                 if (inwrap && (p = index(s, lit)) > 0) s = substr(s, 1, p - 1) substr(s, p + length(lit))
                 t = (s ~ /^(log_[a-z]+|echo|printf)[ \t]/) ? strip(s) : s
-                if (t ~ /(^|[^A-Za-z0-9_.-])(\/[^ \t]*\/)?apt(-get)?([^A-Za-z0-9_.\/-]|$)/)
+                # A trailing comment is not code: drop it so its words cannot
+                # hide or fake an argument. Only when no quote precedes the `#`,
+                # since `x="a #b"; apt-get` has a `#` that is not a comment.
+                if (match(t, /[ \t]#/) && substr(t, 1, RSTART - 1) !~ /["\047]/) t = substr(t, 1, RSTART - 1)
+                if (t ~ /(^|[^A-Za-z0-9_.-])(\/[^ \t]*\/)?(apt(-get|itude)?|dpkg-reconfigure)([^A-Za-z0-9_.\/-]|$)/ \
+                    || lock_taker_by_args(t, "add-apt-repository|apt-add-repository", "(^|[ \t])(--no-update|-[a-zA-Z]*n[a-zA-Z]*)([ \t]|$)", "(^|[ \t])(--update|-[a-zA-Z]*u[a-zA-Z]*)([ \t]|$)") \
+                    || lock_taker_by_args(t, "dpkg", dpkg_ro, ""))
                     print "RAW " FILENAME ":" NR ": " $0
             }
             if ($0 ~ /^}/) inwrap = 0
@@ -223,7 +275,51 @@ raw|flag|apt-get\\\n  install -y x
 raw|flag|apt_get() {\n    LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get "$@" </dev/null\n}\nother() {\n    LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get "$@"\n}
 raw|pass|install -m 0755 -d /etc/apt/keyrings
 raw|pass|curl -fsSL x > /etc/apt/sources.list.d/docker.list
-raw|pass|add-apt-repository -y universe
+raw|flag|add-apt-repository -y universe
+raw|flag|apt-add-repository -y universe
+raw|flag|dpkg -i foo.deb
+raw|flag|dpkg --configure -a
+raw|flag|sudo dpkg --force-all --purge foo
+raw|flag|if ! dpkg -r foo; then
+raw|flag|dpkg-reconfigure tzdata
+raw|flag|aptitude install x
+raw|flag|add-apt-repository -y universe && add-apt-repository -n -y x
+raw|pass|add-apt-repository -n -y universe
+raw|pass|add-apt-repository -yn universe
+raw|pass|add-apt-repository --no-update ppa:x/y
+raw|pass|dpkg --print-architecture
+raw|pass|if dpkg -s qemu-guest-agent >/dev/null 2>&1; then
+raw|pass|arch=$(dpkg --print-architecture)
+raw|pass|dpkg-query -W git
+raw|flag|add-apt-repository -y universe  # -n would skip the update
+raw|pass|dpkg -s x  # never dpkg -i
+raw|flag|dpkg --force-confold \\\n    -i foo.deb
+raw|flag|add-apt-repository -y \\\n    ppa:x/y
+raw|pass|add-apt-repository -y \\\n    -n ppa:x/y
+raw|flag|dpkg "$@"
+raw|flag|dpkg $flags foo.deb
+raw|flag|dpkg -iE foo.deb
+raw|flag|dpkg --set-selections
+raw|flag|dpkg --update-avail x
+raw|pass|add-apt-repository 2>&1 -n x
+raw|flag|x="a #b"; apt-get update
+raw|flag|dpkg "-i" foo.deb
+raw|flag|dpkg 2>&1 -i foo.deb
+raw|flag|dpkg --unpack foo.deb
+raw|flag|dpkg -P foo
+raw|flag|dpkg --triggers-only foo
+raw|flag|dpkg --add-architecture i386
+raw|pass|dpkg -s x 2>&1 | grep -q installed
+raw|pass|dpkg --compare-versions 1 lt 2
+raw|flag|dpkg -s x && dpkg -i y
+raw|flag|sudo add-apt-repository -y universe
+raw|flag|apt-add-repository --update x
+raw|flag|add-apt-repository -n -u x
+raw|pass|apt-add-repository -n x
+raw|pass|add-apt-repository "-n" x
+raw|flag|add-apt-repository -y universe; foo -n
+raw|pass|log_info "dpkg -i is not run here"
+raw|pass|test -e /var/lib/dpkg/lock-frontend
 raw|pass|apt-cache policy git
 raw|pass|log_info "Waiting ($((SECONDS - started))s of ${APT_LOCK_TIMEOUT}s) for the apt lock"
 raw|pass|apt_get update || return 1
@@ -242,13 +338,14 @@ FIXTURES
     if [[ ${rc} -eq 0 ]]; then
         echo "PASS apt guard self-test (${fixtures} fixtures)"
     else
-        FAILED=$((FAILED + 1))
+        GUARD_FAILED=$((GUARD_FAILED + 1))
     fi
 }
 selftest_apt_guards
 
-# Both guards run over every shell script the suite lints, except testing/ —
-# this runner holds the guards' own fixtures, which are apt calls by design. A
+# Both guards run over every shell script the suite lints, except this runner
+# itself — it holds the guards' own fixtures, which are apt calls by design. Any
+# OTHER script under testing/ is judged like the installers. A
 # new installer script that calls apt directly is judged without being listed.
 apt_calls=0
 apt_unchecked=0
@@ -256,7 +353,7 @@ raw_found=0
 raw_files=0
 for script in "${SCRIPTS[@]}"; do
     f="${script#./}"
-    [[ "${f}" == testing/* ]] && continue
+    [[ "${f}" == testing/run-all.sh ]] && continue
     raw_files=$((raw_files + 1))
     report="$(apt_status_report "${f}")"
     apt_calls=$((apt_calls + $(grep -c '^CALL' <<<"${report}" || true)))
@@ -267,23 +364,23 @@ for script in "${SCRIPTS[@]}"; do
     done < <(grep '^UNCHECKED' <<<"${report}" || true)
     while IFS= read -r r; do
         [[ -n "${r}" ]] || continue
-        echo "FAIL raw apt call outside apt_get (or the wrapper line no longer matches the exemption literal): ${r#RAW }"
+        echo "FAIL raw lock-taking call outside apt_get (list: raw_apt_report; or the wrapper line no longer matches the exemption literal): ${r#RAW }"
         raw_found=$((raw_found + 1))
     done < <(raw_apt_report "${f}")
 done
 if [[ ${raw_files} -eq 0 ]]; then
-    echo "FAIL raw apt check: scanned no files — the guard is reading nothing"
-    FAILED=$((FAILED + 1))
+    echo "FAIL raw lock-taking check: scanned no files — the guard is reading nothing"
+    GUARD_FAILED=$((GUARD_FAILED + 1))
 elif [[ ${raw_found} -gt 0 ]]; then
-    FAILED=$((FAILED + 1))
+    GUARD_FAILED=$((GUARD_FAILED + 1))
 else
-    echo "PASS no raw apt/apt-get outside apt_get (${raw_files} file(s) scanned)"
+    echo "PASS no raw lock-taking apt/dpkg call outside apt_get (${raw_files} file(s) scanned)"
 fi
 if [[ ${apt_calls} -eq 0 ]]; then
     echo "FAIL apt_get status check: found no apt_get call statements — the guard is reading nothing"
-    FAILED=$((FAILED + 1))
+    GUARD_FAILED=$((GUARD_FAILED + 1))
 elif [[ ${apt_unchecked} -gt 0 ]]; then
-    FAILED=$((FAILED + 1))
+    GUARD_FAILED=$((GUARD_FAILED + 1))
 else
     echo "PASS apt_get status checked at every call (${apt_calls} statement(s))"
 fi
@@ -304,15 +401,18 @@ for script in "${SCRIPTS[@]}"; do
     else
         [[ ${syntax_rc} -ne 0 ]] && { echo "FAIL ${rel}: bash -n (exit ${syntax_rc})"; sed 's/^/       /' "${syntax_log}"; }
         [[ ${lint_rc} -ne 0 ]] && { echo "FAIL ${rel}: shellcheck (exit ${lint_rc})"; sed 's/^/       /' "${lint_log}"; }
-        FAILED=$((FAILED + 1))
+        FILE_FAILED=$((FILE_FAILED + 1))
     fi
     rm -f "${syntax_log}" "${lint_log}"
 done
 
 echo "-----------------------------------------------------------------"
-if [[ ${FAILED} -eq 0 ]]; then
-    echo "OK: all ${#SCRIPTS[@]} shell file(s) passed bash -n and shellcheck"
+if [[ ${GUARD_FAILED} -eq 0 && ${FILE_FAILED} -eq 0 ]]; then
+    echo "OK: all ${#SCRIPTS[@]} shell file(s) passed bash -n and shellcheck, and every guard check passed"
     exit 0
 fi
-echo "FAILED: ${FAILED} of ${#SCRIPTS[@]} shell file(s)"
+# Guard failures and file failures are counted apart: a red run caused only by
+# a guard must not say a shell file failed lint, or triage starts in the wrong
+# place. Each failing check printed its own FAIL line above.
+echo "FAILED: ${GUARD_FAILED} guard check(s), ${FILE_FAILED} of ${#SCRIPTS[@]} shell file(s)"
 exit 1
