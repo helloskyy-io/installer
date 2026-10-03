@@ -99,7 +99,10 @@ log_error() {
 #
 # ONLY a lock contention retries. apt exits 100 for EVERY failure — a missing
 # package, a dead mirror, DNS — so the exit code cannot tell them apart; the
-# message can. Anything else returns at once with apt's own output intact,
+# message can — and only a message showing CONTENTION counts ("It is held by
+# process", or apt's "(11: Resource temporarily unavailable)" when it cannot name
+# the holder): a permanent "Could not get lock … (13: Permission denied)" must
+# not wait out the timeout. Anything else returns at once with apt's own output intact,
 # because blanket-retrying would turn a real failure into a slow one.
 # LC_ALL=C pins that message to English: apt's errors are translated, and the
 # operator's locale rides in through sudo.
@@ -129,7 +132,7 @@ apt_get() {
     while true; do
         rc=0
         LC_ALL=C apt-get "$@" 2>"$err_file" || rc=$?
-        if [[ $rc -eq 0 ]] || ! grep -q '^E: Could not get lock ' "$err_file"; then
+        if [[ $rc -eq 0 ]] || ! grep -Eq '^E: Could not get lock .*(It is held by process|\(11: Resource temporarily unavailable\))' "$err_file"; then
             cat "$err_file" >&2
             rm -f "$err_file"
             return "$rc"
@@ -367,14 +370,15 @@ install_docker() {
         log_info "Installing Docker using official repository method..."
         
         # Update package index
-        apt_get update
+        apt_get update || return 1
         
         # Install prerequisites
         apt_get install -y \
             ca-certificates \
             curl \
             gnupg \
-            lsb-release
+            lsb-release \
+            || return 1
         
         # Add Docker's official GPG key (modern method, avoids legacy key issues)
         install -m 0755 -d /etc/apt/keyrings
@@ -391,7 +395,7 @@ install_docker() {
           tee /etc/apt/sources.list.d/docker.list > /dev/null
         
         # Update package index with Docker repository
-        apt_get update
+        apt_get update || return 1
         
         # Install Docker Engine, CLI, and containerd
         apt_get install -y \
@@ -399,7 +403,8 @@ install_docker() {
             docker-ce-cli \
             containerd.io \
             docker-buildx-plugin \
-            docker-compose-plugin
+            docker-compose-plugin \
+            || return 1
         
         # Enable and start Docker service
         systemctl enable docker
@@ -530,8 +535,8 @@ install_git() {
         log_info "Git is already installed: $(git --version)"
     else
         log_info "Installing git..."
-        apt_get update
-        apt_get install -y git
+        apt_get update || return 1
+        apt_get install -y git || return 1
         log_info "Git installed successfully"
     fi
     
@@ -1043,9 +1048,9 @@ ensure_qemu_guest_agent() {
         log_info "qemu-guest-agent already installed"
     else
         log_info "Installing qemu-guest-agent (hypervisor integration + backup fs-freeze)..."
-        apt_get update -qq
-        apt_get install -y qemu-guest-agent \
-            || log_warn "qemu-guest-agent install failed (non-fatal; set --agent 1 at VM create + reinstall)"
+        if ! { apt_get update -qq && apt_get install -y qemu-guest-agent; }; then
+            log_warn "qemu-guest-agent install failed (non-fatal; set --agent 1 at VM create + reinstall)"
+        fi
     fi
 }
 

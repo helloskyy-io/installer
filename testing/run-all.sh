@@ -72,6 +72,28 @@ echo "installer test run — ${#SCRIPTS[@]} shell file(s) discovered"
 echo "-----------------------------------------------------------------"
 
 FAILED=0
+
+# `apt_get` is copied word for word into both installers, because each is
+# fetched alone by curl and neither can source the other. A copy nothing
+# compares drifts: a fix to the lock-matching lands in one script and the other
+# keeps the old behaviour. Extraction is from the APT_LOCK_TIMEOUT line to the
+# function's closing brace; an empty extraction FAILS, since two empty blocks
+# compare equal.
+extract_apt_block() {
+    awk '/^APT_LOCK_TIMEOUT=/ {on=1} on {print} on && /^}/ {exit}' "$1"
+}
+sc_block="$(extract_apt_block skyy-command/bootstrap.sh)"
+im_block="$(extract_apt_block image-manager/bootstrap.sh)"
+if [[ -z "${sc_block}" || -z "${im_block}" ]]; then
+    echo "FAIL apt_get drift check: could not extract the apt_get block from both bootstrap.sh files"
+    FAILED=$((FAILED + 1))
+elif [[ "${sc_block}" != "${im_block}" ]]; then
+    echo "FAIL apt_get drift check: the copies in skyy-command/ and image-manager/ bootstrap.sh differ"
+    diff <(echo "${sc_block}") <(echo "${im_block}") | sed 's/^/       /' || true
+    FAILED=$((FAILED + 1))
+else
+    echo "PASS apt_get copies identical (skyy-command, image-manager)"
+fi
 for script in "${SCRIPTS[@]}"; do
     rel="${script#./}"
     # Each control is measured on its own, so a report names WHICH one failed.

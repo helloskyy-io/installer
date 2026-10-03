@@ -109,7 +109,10 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 #
 # ONLY a lock contention retries. apt exits 100 for EVERY failure — a missing
 # package, a dead mirror, DNS — so the exit code cannot tell them apart; the
-# message can. Anything else returns at once with apt's own output intact,
+# message can — and only a message showing CONTENTION counts ("It is held by
+# process", or apt's "(11: Resource temporarily unavailable)" when it cannot name
+# the holder): a permanent "Could not get lock … (13: Permission denied)" must
+# not wait out the timeout. Anything else returns at once with apt's own output intact,
 # because blanket-retrying would turn a real failure into a slow one.
 # LC_ALL=C pins that message to English: apt's errors are translated, and the
 # operator's locale rides in through sudo.
@@ -139,7 +142,7 @@ apt_get() {
     while true; do
         rc=0
         LC_ALL=C apt-get "$@" 2>"$err_file" || rc=$?
-        if [[ $rc -eq 0 ]] || ! grep -q '^E: Could not get lock ' "$err_file"; then
+        if [[ $rc -eq 0 ]] || ! grep -Eq '^E: Could not get lock .*(It is held by process|\(11: Resource temporarily unavailable\))' "$err_file"; then
             cat "$err_file" >&2
             rm -f "$err_file"
             return "$rc"
