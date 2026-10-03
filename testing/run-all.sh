@@ -144,7 +144,16 @@ apt_status_report() {
 # arguments contain a read-only action (--print-architecture, -s, -l, -L, -S,
 # -p, --get-selections, --compare-versions, --version, --help, --assert-*), so
 # `dpkg "$@"`, a bundled `-iE`, or an unlisted mutating action is flagged.
-# Limit: a lock-taking command not named here is not flagged. `apt`/`apt-get` is flagged as a command word
+# Also: `apt-cdrom`, `unattended-upgrade(s)` always; `apt-mark` unless
+# showauto/showmanual/showhold; `dpkg-divert` / `dpkg-statoverride` unless
+# --list/--listpackage/--truename; `dpkg-trigger` unless --check-supported — each of those four only when that action is the first
+# non-option argument. DERIVED, not recalled: every binary shipped by the apt, apt-utils, dpkg,
+# software-properties-common and unattended-upgrades packages (`dpkg -L <pkg>
+# | grep bin/`) was classified. Not flagged, because they take no dpkg/apt
+# lock: apt-cache, apt-config, apt-key, apt-extracttemplates, apt-ftparchive,
+# apt-sortpkgs, dpkg-deb, dpkg-query, dpkg-split, dpkg-realpath,
+# dpkg-maintscript-helper, update-alternatives, start-stop-daemon.
+# Limit: a lock-taking command from a package not listed above is not flagged. `apt`/`apt-get` is flagged as a command word
 # ANYWHERE on a non-comment line — after `if`, `then`, `timeout N`, `command`,
 # `sudo`, `$(`, or behind an absolute path — not only at line start. Quoted
 # text is dropped ONLY on a log line (`log_*`, `echo`, `printf` — their
@@ -192,6 +201,10 @@ raw_apt_report() {
             return 0
         }
         BEGIN { dpkg_ro = "(^|[ \t])(--print-architecture|--print-foreign-architectures|-s|--status|-l|--list|-L|--listfiles|-S|--search|-p|--print-avail|--get-selections|--compare-versions|--version|--help|--assert-[a-z-]+)([ \t=)`]|$)" }
+        # For the commands whose read-only action is a subcommand: the action must be
+        # the FIRST non-option argument, so `apt-mark hold x $(apt-mark showhold)`
+        # cannot pass on a read-only word that belongs to another command.
+        BEGIN { first = "^([ \t]+-[^ \t]*)*[ \t]+"; ro_end = "([ \t=)`]|$)" }
         BEGIN { lit = "LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get \"$@\"" }
         # Backslash continuations are joined first, as apt_status_report does, so
         # a flag on the next line is seen as an argument of its command.
@@ -208,9 +221,12 @@ raw_apt_report() {
                 # hide or fake an argument. Only when no quote precedes the `#`,
                 # since `x="a #b"; apt-get` has a `#` that is not a comment.
                 if (match(t, /[ \t]#/) && substr(t, 1, RSTART - 1) !~ /["\047]/) t = substr(t, 1, RSTART - 1)
-                if (t ~ /(^|[^A-Za-z0-9_.-])(\/[^ \t]*\/)?(apt(-get|itude)?|dpkg-reconfigure)([^A-Za-z0-9_.\/-]|$)/ \
+                if (t ~ /(^|[^A-Za-z0-9_.-])(\/[^ \t]*\/)?(apt(-get|itude)?|apt-cdrom|dpkg-reconfigure|unattended-upgrades?)([^A-Za-z0-9_.\/-]|$)/ \
                     || lock_taker_by_args(t, "add-apt-repository|apt-add-repository", "(^|[ \t])(--no-update|-[a-zA-Z]*n[a-zA-Z]*)([ \t]|$)", "(^|[ \t])(--update|-[a-zA-Z]*u[a-zA-Z]*)([ \t]|$)") \
-                    || lock_taker_by_args(t, "dpkg", dpkg_ro, ""))
+                    || lock_taker_by_args(t, "dpkg", dpkg_ro, "") \
+                    || lock_taker_by_args(t, "apt-mark", first "(showauto|showmanual|showhold)" ro_end, "") \
+                    || lock_taker_by_args(t, "dpkg-divert|dpkg-statoverride", first "(--list|--listpackage|--truename)" ro_end, "") \
+                    || lock_taker_by_args(t, "dpkg-trigger", first "--check-supported" ro_end, ""))
                     print "RAW " FILENAME ":" NR ": " $0
             }
             if ($0 ~ /^}/) inwrap = 0
@@ -323,6 +339,35 @@ raw|pass|test -e /var/lib/dpkg/lock-frontend
 raw|pass|apt-cache policy git
 raw|pass|log_info "Waiting ($((SECONDS - started))s of ${APT_LOCK_TIMEOUT}s) for the apt lock"
 raw|pass|apt_get update || return 1
+raw|flag|apt-mark hold showhold
+raw|flag|apt-mark unhold $(apt-mark showhold | xargs)
+raw|flag|dpkg-divert --add /x --list
+raw|pass|x="$(apt-mark showhold)"
+raw|pass|if [[ -n "$(apt-mark showhold)" ]]; then
+raw|pass|apt-mark -q showhold
+raw|pass|apt-config dump
+raw|pass|dpkg-deb -I x.deb
+raw|pass|update-alternatives --list editor
+raw|flag|apt-mark hold docker-ce
+raw|flag|sudo apt-mark unhold docker-ce
+raw|flag|apt-mark "$@"
+raw|flag|unattended-upgrade -d
+raw|flag|unattended-upgrades --dry-run
+raw|flag|apt-cdrom add
+raw|flag|dpkg-divert --add --rename /bin/true
+raw|flag|dpkg-statoverride --update --add root root 0755 /x
+raw|flag|dpkg-trigger --by-package=x foo
+raw|flag|/usr/bin/apt-mark hold x
+raw|flag|a && apt-mark manual x
+raw|flag|apt-mark showhold; apt-mark hold x
+raw|pass|apt-mark showhold
+raw|pass|apt-mark showmanual | grep -q git
+raw|pass|dpkg-divert --list
+raw|pass|dpkg-statoverride --list /x
+raw|pass|dpkg-trigger --check-supported
+raw|pass|apt-key list
+raw|pass|dpkg-query -W git
+raw|pass|log_info "apt-mark hold and unattended-upgrade are not run here"
 status|flag|apt_get update
 status|flag|apt_get update || true
 status|flag|if x; then apt_get update; fi
