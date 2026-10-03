@@ -127,8 +127,13 @@ apt_status_report() {
 # wait and the status guard alike. `apt`/`apt-get` is flagged as a command word
 # ANYWHERE on a non-comment line — after `if`, `then`, `timeout N`, `command`,
 # `sudo`, `$(`, or behind an absolute path — not only at line start. Quoted
-# text is dropped first (log messages say "the apt lock"), EXCEPT a double-
-# quoted string holding `$(` or a backtick, which can run a command. The one
+# text is dropped ONLY on a log line (`log_*`, `echo`, `printf` — their
+# messages say "the apt lock"), and even there a double-quoted string holding
+# `$(` or a backtick is kept because it can run a command. Everywhere else
+# quotes are kept, so `bash -c '…apt-get…'`, `eval "…"` and `"apt-get" update`
+# are flagged. Known limits: escaped quotes inside a log message can produce a
+# false flag, and `command -v apt-get` / `cd /etc/apt` are flagged too (an
+# argument is not told from a command) — both fail loudly, never pass. The one
 # exemption is the wrapper's own invocation, and only inside the apt_get()
 # body: the same text anywhere else is still a raw call.
 raw_apt_report() {
@@ -152,7 +157,8 @@ raw_apt_report() {
             s = $0; sub(/^[ \t]+/, "", s)
             if (s !~ /^#/) {
                 if (inwrap && (p = index(s, lit)) > 0) s = substr(s, 1, p - 1) substr(s, p + length(lit))
-                if (strip(s) ~ /(^|[^A-Za-z0-9_.-])(\/[^ \t]*\/)?apt(-get)?([ \t]|$)/)
+                t = (s ~ /^(log_[a-z]+|echo|printf)[ \t]/) ? strip(s) : s
+                if (t ~ /(^|[^A-Za-z0-9_.-])(\/[^ \t]*\/)?apt(-get)?([^A-Za-z0-9_.\/-]|$)/)
                     print "RAW " FILENAME ":" NR ": " $0
             }
             if ($0 ~ /^}/) inwrap = 0
@@ -201,6 +207,25 @@ raw|pass|log_info "waiting for the apt lock (${holder:-another apt/dpkg process}
 raw|pass|# apt-get is raw here
 raw|pass|echo done # apt-get note
 raw|pass|systemctl is-active apt-daily.timer
+raw|flag|bash -c 'apt-get update'
+raw|flag|sudo sh -c "apt-get install -y x"
+raw|flag|eval "apt-get update"
+raw|flag|"/usr/bin/apt-get" update
+raw|flag|"apt-get" update
+raw|flag|exec apt-get update
+raw|flag|env X=1 apt-get update
+raw|flag|a && apt-get update
+raw|flag|a | apt-get update
+raw|flag|(apt-get)
+raw|flag|apt-get;
+raw|flag|apt-get</dev/null
+raw|flag|apt-get\\\n  install -y x
+raw|flag|apt_get() {\n    LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get "$@" </dev/null\n}\nother() {\n    LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get "$@"\n}
+raw|pass|install -m 0755 -d /etc/apt/keyrings
+raw|pass|curl -fsSL x > /etc/apt/sources.list.d/docker.list
+raw|pass|add-apt-repository -y universe
+raw|pass|apt-cache policy git
+raw|pass|log_info "Waiting ($((SECONDS - started))s of ${APT_LOCK_TIMEOUT}s) for the apt lock"
 raw|pass|apt_get update || return 1
 status|flag|apt_get update
 status|flag|apt_get update || true
@@ -208,6 +233,10 @@ status|flag|if x; then apt_get update; fi
 status|pass|apt_get update || return 1
 status|pass|{ apt_get update && apt_get install -y acl; } || { log_error x; return 1; }
 status|pass|if ! apt_get update; then
+status|pass|apt_get install -y \\\n    acl || return 1
+status|pass|while ! apt_get update; do
+status|pass|apt_get update || exit 1
+status|flag|apt_get install -y \\\n    acl || true
 FIXTURES
     rm -f "${file}"
     if [[ ${rc} -eq 0 ]]; then
@@ -224,9 +253,11 @@ selftest_apt_guards
 apt_calls=0
 apt_unchecked=0
 raw_found=0
+raw_files=0
 for script in "${SCRIPTS[@]}"; do
     f="${script#./}"
     [[ "${f}" == testing/* ]] && continue
+    raw_files=$((raw_files + 1))
     report="$(apt_status_report "${f}")"
     apt_calls=$((apt_calls + $(grep -c '^CALL' <<<"${report}" || true)))
     while IFS= read -r u; do
@@ -236,12 +267,17 @@ for script in "${SCRIPTS[@]}"; do
     done < <(grep '^UNCHECKED' <<<"${report}" || true)
     while IFS= read -r r; do
         [[ -n "${r}" ]] || continue
-        echo "FAIL raw apt call outside apt_get: ${r#RAW }"
+        echo "FAIL raw apt call outside apt_get (or the wrapper line no longer matches the exemption literal): ${r#RAW }"
         raw_found=$((raw_found + 1))
     done < <(raw_apt_report "${f}")
 done
-if [[ ${raw_found} -gt 0 ]]; then
+if [[ ${raw_files} -eq 0 ]]; then
+    echo "FAIL raw apt check: scanned no files — the guard is reading nothing"
     FAILED=$((FAILED + 1))
+elif [[ ${raw_found} -gt 0 ]]; then
+    FAILED=$((FAILED + 1))
+else
+    echo "PASS no raw apt/apt-get outside apt_get (${raw_files} file(s) scanned)"
 fi
 if [[ ${apt_calls} -eq 0 ]]; then
     echo "FAIL apt_get status check: found no apt_get call statements — the guard is reading nothing"
