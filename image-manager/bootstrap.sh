@@ -101,6 +101,64 @@ log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# A HELD APT LOCK IS TRANSIENT, NOT FATAL. Ubuntu starts apt-daily and
+# unattended-upgrades by itself on boot, so the documented flow — create a VM,
+# run the one-liner — races them, and a prompt operator loses: `apt-get` exits
+# 100 with "Could not get lock". Every apt call in this script goes through
+# apt_get, which waits (bounded) for the holder to finish and retries.
+#
+# ONLY a lock contention retries. apt exits 100 for EVERY failure — a missing
+# package, a dead mirror, DNS — so the exit code cannot tell them apart; the
+# message can. Anything else returns at once with apt's own output intact,
+# because blanket-retrying would turn a real failure into a slow one.
+# LC_ALL=C pins that message to English: apt's errors are translated, and the
+# operator's locale rides in through sudo.
+#
+# Its own messages go to stderr: callers send apt's stdout to /dev/null, and
+# an operator watching a silent wait cannot tell it from a hang.
+#
+# The lock is waited on, never broken: unattended-upgrades is a security
+# mechanism, and terminating it on the operator's machine is not ours to do.
+#
+# Duplicated verbatim in skyy-command/bootstrap.sh, deliberately: each installer is
+# fetched alone by curl, so neither can source the other.
+#
+# Seconds, overridable for a slow first boot. A fresh image months behind on
+# security updates can keep unattended-upgrades busy for several minutes.
+APT_LOCK_TIMEOUT="${APT_LOCK_TIMEOUT:-600}"
+APT_LOCK_POLL_SECONDS=10
+
+apt_get() {
+    local err_file rc lock holder
+    # Validated before the arithmetic below, which would read a non-number as a
+    # variable name.
+    [[ "$APT_LOCK_TIMEOUT" =~ ^[0-9]+$ ]] || { log_error "APT_LOCK_TIMEOUT must be a whole number of seconds, got '$APT_LOCK_TIMEOUT'" >&2; return 1; }
+    local deadline=$((SECONDS + APT_LOCK_TIMEOUT))
+    local started=$SECONDS
+    err_file="$(mktemp)" || { log_error "apt_get: could not create a temp file" >&2; return 1; }
+    while true; do
+        rc=0
+        LC_ALL=C apt-get "$@" 2>"$err_file" || rc=$?
+        if [[ $rc -eq 0 ]] || ! grep -q '^E: Could not get lock ' "$err_file"; then
+            cat "$err_file" >&2
+            rm -f "$err_file"
+            return "$rc"
+        fi
+        # "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 1206 (unattended-upgr)"
+        lock="$(sed -n 's/^E: Could not get lock \(\/[^ ]*\)\. .*/\1/p;T;q' "$err_file")"
+        holder="$(sed -n 's/.*It is held by process \([0-9]*\) (\(.*\))$/\2 (pid \1)/p;T;q' "$err_file")"
+        if (( SECONDS >= deadline )); then
+            cat "$err_file" >&2
+            rm -f "$err_file"
+            log_error "Gave up after ${APT_LOCK_TIMEOUT}s waiting for ${holder:-another apt/dpkg process} to release ${lock:-the apt lock}" >&2
+            log_error "Re-run once it finishes, or raise APT_LOCK_TIMEOUT" >&2
+            return "$rc"
+        fi
+        log_info "Waiting for ${holder:-another apt/dpkg process} to release ${lock:-the apt lock} ($((SECONDS - started))s of ${APT_LOCK_TIMEOUT}s)..." >&2
+        sleep "$APT_LOCK_POLL_SECONDS"
+    done
+}
+
 PAT=""
 ASKPASS_DIR=""
 # The probe's last HTTP status — how a REFUSAL is told from a FAILURE TO ASK.
@@ -280,15 +338,15 @@ resolve_pat() {
 ensure_acl() {
     command -v setfacl >/dev/null 2>&1 && return 0
     log_info "Installing 'acl' (provides setfacl)..."
-    apt-get update -qq
-    apt-get install -y acl >/dev/null || { log_error "Failed to install 'acl'"; return 1; }
+    apt_get update -qq
+    apt_get install -y acl >/dev/null || { log_error "Failed to install 'acl'"; return 1; }
 }
 
 ensure_git() {
     if ! command -v git >/dev/null 2>&1; then
         log_info "Installing git..."
-        apt-get update -qq
-        apt-get install -y git >/dev/null || { log_error "Failed to install git"; return 1; }
+        apt_get update -qq
+        apt_get install -y git >/dev/null || { log_error "Failed to install git"; return 1; }
     fi
     git config --global --add safe.directory "$REPO_DIR" 2>/dev/null || true
     git config --global user.name  "$GIT_USER_NAME"  2>/dev/null || true
